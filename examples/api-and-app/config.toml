@@ -1,0 +1,46 @@
+# Two repos worked on together: an API that owns the contract (OpenAPI spec), and a mobile app that
+# consumes it. Lives at api/.nightshift/config.toml; relative paths resolve against api/.
+#
+#   projects/
+#   ├── api/          ← home: .nightshift/ lives here
+#   ├── app/
+#   └── .worktrees/   ← git worktrees for both repos
+
+default_repo = "api"
+
+[repos]
+api = "."
+app = "../app"
+
+[agent]
+backend = "cli"
+permission_mode = "auto"
+max_turns = 250
+# Both repos keep their git worktrees in ../.worktrees, outside each session's working directory.
+add_dirs = [".."]
+
+[budget]
+item_usd = 30
+invocation_usd = 200
+
+[review]
+# A second-opinion review from a different model or tool that posts inline comments on the PR.
+# Any shell command works; it runs in the repo with the PR number substituted.
+command = "~/bin/review-pr --post-comments {pr}"
+max_rounds = 2
+timeout_minutes = 60
+
+[checks]
+wait = true
+settle_seconds = 120
+max_fix_rounds = 2
+
+[merge]
+method = "merge"        # keep every commit; never squash
+
+[limits]
+max_items = 10
+min_free_disk_gb = 10   # local databases and mobile builds need headroom
+
+[notify]
+command = 'terminal-notifier -title nightshift -message "$NIGHTSHIFT_KIND: $NIGHTSHIFT_REASON"'

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+.DS_Store
+# nightshift's own runtime files, if you dogfood it here
+.nightshift/runs/
+.nightshift/state.json
+.nightshift/lock
+.nightshift/STOP
