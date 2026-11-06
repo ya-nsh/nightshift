@@ -43,8 +43,11 @@ Everything between the Claude steps is deterministic code, not a prompt:
 ## Install
 
 ```bash
-npm install -g github:ya-nsh/nightshift
+npm install -g nightshift
 ```
+
+Or try it without installing: `npx nightshift doctor`. The latest `main` installs with
+`npm install -g github:ya-nsh/nightshift`.
 
 ## Quick start
 
