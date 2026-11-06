@@ -1,5 +1,5 @@
 {
-  "name": "nightshift",
+  "name": "@deva00/nightshift",
   "version": "0.1.0",
   "description": "Let Claude Code work through your todo list unattended: one fresh session per item, a pull request, an independent review, green CI, a normal merge, and a handoff to the next session.",
   "keywords": [
@@ -29,6 +29,9 @@
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22"
   },
