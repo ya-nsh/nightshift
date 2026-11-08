@@ -5,13 +5,16 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { ClaudeCliAgent } from "./agent/cli.js";
 import { ClaudeSdkAgent, loadSdkQuery } from "./agent/sdk.js";
-import { type Config, ConfigError, findConfig, loadConfig } from "./config.js";
+import { type Config, ConfigError, findConfig, loadConfig, planSettings } from "./config.js";
 import { cliPath, DAEMON_LOCK, DAEMON_LOG, daemonLogger, runDaemon } from "./daemon.js";
 import { exec } from "./exec.js";
+import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { GhForge } from "./github.js";
 import { NodeHost, STOP_FILE } from "./host.js";
 import { init } from "./init.js";
-import { type Exit, newRunState, Pipeline } from "./pipeline.js";
+import { describeQueue, quote, releaseClaim } from "./issues.js";
+import { type Exit, newIssuesRunState, newRunState, Pipeline } from "./pipeline.js";
+import { formatPlan, makePlan, PlanError, parsePlanCount, writePlan } from "./plan.js";
 import type { Agent } from "./ports.js";
 import { preflight } from "./preflight.js";
 import { loadReport } from "./report.js";
@@ -37,6 +40,7 @@ import {
   type UsageWindow,
   usageLimits,
 } from "./usage.js";
+import { watch } from "./watch.js";
 
 const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -51,10 +55,17 @@ Usage:
   nightshift doctor                          check gh, claude, repos, review command, disk
   nightshift run (--prompt TEXT | --prompt-file FILE) [--repo ALIAS] [--once] [--max-items N]
                  [--usage-share PCT] [--force]
-                                             start a run with the first item's prompt
+                                             start a run with the first item's prompt (with
+                                             [tasks] source = "github_issues" the prompt is
+                                             optional: extra instructions for every issue)
   nightshift resume [--answer TEXT] [--once] [--max-items N] [--usage-share PCT]
                                              continue a halted or paused run
+  nightshift plan [-n N] [--prompt TEXT | --prompt-file FILE] [--repo ALIAS] [--json] [--write]
+                                             preview the next N items (default 5) in a read-only
+                                             Claude session; changes nothing
   nightshift status [--json]                 show the current run
+  nightshift watch [--once]                  follow the current run live (q quits; --once prints
+                                             one frame)
   nightshift stop                            stop gracefully after the current step
   nightshift report [--run ID]               print the run's report (default: the current run)
   nightshift daemon                          watch the run and resume it when it can continue
@@ -81,7 +92,9 @@ const COMMANDS = new Set([
   "doctor",
   "run",
   "resume",
+  "plan",
   "status",
+  "watch",
   "stop",
   "report",
   "daemon",
@@ -106,6 +119,8 @@ async function main(argv: string[]): Promise<number> {
       answer: { type: "string" },
       run: { type: "string" },
       json: { type: "boolean", default: false },
+      count: { type: "string", short: "n" },
+      write: { type: "boolean", default: false },
       "eject-prompts": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -155,8 +170,29 @@ async function main(argv: string[]): Promise<number> {
         ? 0
         : 1;
     }
+    case "plan": {
+      const count = parsePlanCount(values.count);
+      if (values.repo !== undefined && config.repos[values.repo] === undefined) {
+        throw new UsageError(
+          `unknown repo "${values.repo}"; configured: ${Object.keys(config.repos).join(", ")}`,
+        );
+      }
+      const given = values.prompt !== undefined || values["prompt-file"] !== undefined;
+      const prompt = given
+        ? await readPrompt(values.prompt, values["prompt-file"], cwd)
+        : undefined;
+      return plan(config, await store.load(), {
+        count,
+        ...(prompt === undefined ? {} : { prompt }),
+        ...(values.repo === undefined ? {} : { repo: values.repo }),
+        json: values.json,
+        write: values.write,
+      });
+    }
     case "status":
-      return status(await store.load(), values.json, config);
+      return await status(await store.load(), values.json, config);
+    case "watch":
+      return watch({ dir: config.dir, usage: config.usage, once: values.once });
     case "report": {
       const report = await loadReport(store, values.run, new Date()).catch((error: Error) => {
         throw new UsageError(error.message);
@@ -177,8 +213,17 @@ async function main(argv: string[]): Promise<number> {
       console.log("nightshift will stop after the current step");
       return 0;
     case "run": {
+      const fromIssues = config.tasks.source === "github_issues";
       const prompt = await readPrompt(values.prompt, values["prompt-file"], cwd);
-      const repo = values.repo ?? config.defaultRepo;
+      if (prompt === undefined && !fromIssues) {
+        throw new UsageError("give exactly one of --prompt or --prompt-file");
+      }
+      if (fromIssues && values.repo !== undefined && values.repo !== config.tasks.repo) {
+        throw new UsageError(
+          `issues come from [tasks] repo = "${config.tasks.repo}"; --repo cannot change that`,
+        );
+      }
+      const repo = values.repo ?? (fromIssues ? config.tasks.repo : config.defaultRepo);
       if (config.repos[repo] === undefined) {
         throw new UsageError(
           `unknown repo "${repo}"; configured: ${Object.keys(config.repos).join(", ")}`,
@@ -194,9 +239,16 @@ async function main(argv: string[]): Promise<number> {
           }
         }
         if (!(await doctor(config, usageShare, undefined))) return 1;
-        if (existing) await store.archive(existing);
+        if (existing) {
+          if (existing.status !== "done") await releaseAbandonedIssue(existing);
+          await store.archive(existing);
+        }
         const now = new Date();
-        const state = newRunState(newRunId(now), now, repo, prompt);
+        const runId = newRunId(now);
+        const state =
+          fromIssues || prompt === undefined
+            ? newIssuesRunState(runId, now, prompt)
+            : newRunState(runId, now, repo, prompt);
         if (usageShare !== undefined) state.usageShare = usageShare;
         await store.save(state);
         return drive(config, store, state, maxItems, undefined);
@@ -278,6 +330,88 @@ async function drive(
   }
 }
 
+/** `run --force` abandons a run: the issue it was working on is free for the next run again. */
+async function releaseAbandonedIssue(state: RunState): Promise<void> {
+  const issue = state.item?.issue;
+  if (issue === undefined) return;
+  const forge = new GhForge();
+  try {
+    await forge.commentIssue(
+      issue.repoSlug,
+      issue.number,
+      `**nightshift** abandoned run \`${state.runId}\`, which was working on this issue${state.haltReason ? `:\n\n${quote(state.haltReason)}` : "."}\n\nThe issue is no longer claimed.`,
+    );
+    await releaseClaim(forge, issue);
+    console.error(`released issue #${issue.number} (${issue.url})`);
+  } catch (error) {
+    console.error(
+      `could not release issue #${issue.number} (${issue.url}): ${(error as Error).message}; remove its in-progress label and assignee yourself`,
+    );
+  }
+}
+
+/**
+ * `nightshift plan` takes no lock and never writes state.json: it reads the run as it is, so it can
+ * run next to a live run without disturbing it.
+ */
+async function plan(
+  config: Config,
+  state: RunState | undefined,
+  options: { count: number; prompt?: string; repo?: string; json: boolean; write: boolean },
+): Promise<number> {
+  const holder = lockHolder(config.dir);
+  if (holder !== undefined) {
+    console.error(
+      `note: a run is being driven (pid ${holder}); planning from its state as of now, without touching it`,
+    );
+  }
+  const agent: Agent =
+    config.agent.backend === "sdk"
+      ? new ClaudeSdkAgent(config.agent, await loadSdkQuery(config.home))
+      : new ClaudeCliAgent(config.agent);
+  const controller = new AbortController();
+  let interrupts = 0;
+  const onSignal = () => {
+    interrupts += 1;
+    if (interrupts > 1) process.exit(130);
+    controller.abort();
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    console.error(
+      `planning the next ${options.count} item(s) · ${agent.name} · model ${planSettings(config.agent).model ?? "default"} · read-only · budget $${config.budget.plan_usd.toFixed(2)}`,
+    );
+    const outcome = await makePlan(
+      {
+        config,
+        templates: await loadTemplates(config.promptsDir),
+        agent,
+        usage: new ClaudeUsageMeter(config.agent.claude_path, config.home),
+        now: () => new Date(),
+        log: (line) => console.error(line),
+      },
+      state,
+      { ...options, signal: controller.signal },
+    );
+    if (!outcome.ok) {
+      const cost = outcome.costUsd > 0 ? ` (cost $${outcome.costUsd.toFixed(2)})` : "";
+      console.error(`nightshift plan: ${outcome.reason}${cost}`);
+      return outcome.aborted ? 130 : 1;
+    }
+    if (options.json) console.log(JSON.stringify(outcome.plan, null, 2));
+    else console.log(formatPlan(outcome.plan));
+    if (options.write) {
+      const file = await writePlan(config.dir, outcome.plan);
+      console.error(`wrote ${path.relative(process.cwd(), file) || file}`);
+    }
+    return 0;
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
 function printExit(exit: Exit): void {
   const { state } = exit;
   const lines = [
@@ -309,13 +443,14 @@ async function doctor(
   return checks.every((check) => check.ok);
 }
 
-function status(state: RunState | undefined, json: boolean, config: Config): number {
+async function status(state: RunState | undefined, json: boolean, config: Config): Promise<number> {
   if (json) {
     console.log(JSON.stringify(state ?? null, null, 2));
     return 0;
   }
+  const tasks = await describeTasks(config);
   if (state === undefined) {
-    console.log("no run yet");
+    console.log(`no run yet\n${tasks}`);
     return 0;
   }
   const now = new Date();
@@ -335,6 +470,7 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
     lines.push(
       `item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}${formatPoints(item.usagePoints)}`,
     );
+    if (item.issue) lines.push(`issue ${item.issue.url} — ${item.issue.title}`);
     if (item.pr) lines.push(`PR ${item.pr.url}`);
     const activity = item.activity;
     if (activity && holder !== undefined) {
@@ -354,6 +490,7 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
   if (state.waiting !== undefined && holder !== undefined) {
     lines.push(`waiting until ${formatTime(state.waiting.until, now)}: ${state.waiting.reason}`);
   }
+  lines.push(tasks);
   const limits = usageLimits(config.usage, state.usageShare);
   const usage = state.usage;
   if (usage?.last !== undefined) {
@@ -363,8 +500,26 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
   } else if (limitsEnabled(limits)) {
     lines.push("usage: not read yet");
   }
+  const forecast = describeForecast({
+    estimate: estimateItem(await readHistory(config.dir), config.usage.forecast_percentile),
+    limits,
+    tally: usage?.tally ?? {},
+    windows: usage?.last?.windows,
+    ranges: config.schedule.active_hours,
+    now,
+  });
+  for (const line of forecast) lines.push(`forecast: ${line}`);
   console.log(lines.join("\n"));
   return 0;
+}
+
+/** The task source and, for GitHub issues, the queue and the next issue. */
+async function describeTasks(config: Config): Promise<string> {
+  if (config.tasks.source !== "github_issues") {
+    return "tasks: handoff (the finalize step writes the next prompt)";
+  }
+  const queue = await describeQueue(new GhForge(), config);
+  return `tasks: ${queue.detail}`;
 }
 
 function formatPoints(points: Partial<Record<UsageWindow, number>> | undefined): string {
@@ -476,14 +631,16 @@ async function service(action: string, config: Config, file: string): Promise<nu
   }
 }
 
+/** The prompt from --prompt or --prompt-file; undefined when neither is given. */
 async function readPrompt(
   text: string | undefined,
   file: string | undefined,
   cwd: string,
-): Promise<string> {
-  if ((text === undefined) === (file === undefined)) {
-    throw new UsageError("give exactly one of --prompt or --prompt-file");
+): Promise<string | undefined> {
+  if (text !== undefined && file !== undefined) {
+    throw new UsageError("give only one of --prompt or --prompt-file");
   }
+  if (text === undefined && file === undefined) return undefined;
   const prompt = text ?? (await readFile(path.resolve(cwd, file as string), "utf8"));
   if (prompt.trim() === "") throw new UsageError("the prompt is empty");
   return prompt;
@@ -523,6 +680,7 @@ main(process.argv.slice(2)).then(
   (error: unknown) => {
     const known =
       error instanceof UsageError ||
+      error instanceof PlanError ||
       error instanceof ConfigError ||
       error instanceof LockedError ||
       String((error as { code?: unknown }).code ?? "").startsWith("ERR_PARSE_ARGS");

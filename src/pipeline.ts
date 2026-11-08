@@ -1,12 +1,25 @@
 import path from "node:path";
 import type { z } from "zod";
 import { acknowledge, allowedUsers, findAnswer, postQuestion } from "./answers.js";
-import type { Config } from "./config.js";
+import { type AgentStep, type Config, type StepSettings, stepSettings } from "./config.js";
+import { decideStart, estimateItem, readHistory } from "./forecast.js";
+import {
+  BLOCKED_COLOR,
+  BLOCKED_DESCRIPTION,
+  hasLabel,
+  IN_PROGRESS_COLOR,
+  IN_PROGRESS_DESCRIPTION,
+  ineligible,
+  quote,
+  rankIssues,
+  releaseClaim,
+} from "./issues.js";
 import type {
   Agent,
   AgentResult,
   Forge,
   Host,
+  Issue,
   Reviewer,
   UsageMeter,
   UsageWindows,
@@ -14,6 +27,7 @@ import type {
 import { writeReport } from "./report.js";
 import { isActive, nextStart } from "./schedule.js";
 import {
+  finalizeIssueResult,
   finalizeResult,
   type ImplementResult,
   implementResult,
@@ -21,7 +35,7 @@ import {
   stepResult,
   toJsonSchema,
 } from "./schemas.js";
-import type { ItemState, Phase, RunState, StateStore, StopCause } from "./state.js";
+import type { ItemIssue, ItemState, Phase, RunState, StateStore, StopCause } from "./state.js";
 import { render, type TemplateName, type Templates } from "./templates.js";
 import {
   account,
@@ -51,6 +65,14 @@ const USAGE_READ_ATTEMPTS = 3;
 const USAGE_RETRY_MS = 5_000;
 /** While a step runs, progress is written to state.json at most this often. */
 const PROGRESS_SAVE_MS = 10_000;
+/** The `[agent.steps.<step>]` table each step template runs with. */
+const STEP_OF_TEMPLATE: Partial<Record<TemplateName, AgentStep>> = {
+  implement: "implement",
+  address: "address",
+  "fix-checks": "fix_checks",
+  "resolve-conflicts": "resolve_conflicts",
+  finalize: "finalize",
+};
 
 export interface PipelineDeps {
   config: Config;
@@ -128,6 +150,26 @@ export function newRunState(runId: string, now: Date, repo: string, prompt: stri
 }
 
 /**
+ * A run whose tasks come from GitHub issues (`[tasks] source = "github_issues"`): it starts without
+ * an item and picks the first issue itself. `instructions` (from `--prompt`) go with every issue.
+ */
+export function newIssuesRunState(
+  runId: string,
+  now: Date,
+  instructions: string | undefined,
+): RunState {
+  return {
+    version: 1,
+    runId,
+    startedAt: now.toISOString(),
+    status: "running",
+    itemsCompleted: 0,
+    costUsd: 0,
+    issues: instructions === undefined || instructions.trim() === "" ? {} : { instructions },
+  };
+}
+
+/**
  * Drives one item at a time through
  * implement → review ⇄ address → checks ⇄ fix_checks → merge (⇄ resolve_conflicts) → finalize,
  * persisting state after every transition so a crash or Ctrl-C resumes where it stopped.
@@ -138,6 +180,10 @@ export class Pipeline {
   private signal: AbortSignal = new AbortController().signal;
   /** The phase running now, so a stop can record its time before writing the report. */
   private openPhase: { item: number; phase: Phase; startedAt: number } | undefined;
+  /** Time spent in usage, schedule and forecast waits, so item time can leave it out. */
+  private waitedMs = 0;
+  /** When the running step started, and `waitedMs` then. */
+  private stepClock: { at: number; waited: number } | undefined;
 
   constructor(
     private readonly deps: PipelineDeps,
@@ -147,7 +193,8 @@ export class Pipeline {
   async run(options: InvocationOptions): Promise<Exit> {
     this.signal = options.signal;
     const item = this.state.item;
-    if (this.state.status === "done" || item === undefined) {
+    // A run on GitHub issues may sit between items: it picks the next issue itself.
+    if (this.state.status === "done" || (item === undefined && !this.fromIssues())) {
       return {
         kind: "done",
         reason: this.state.haltReason ?? "run already finished",
@@ -155,12 +202,12 @@ export class Pipeline {
       };
     }
     if (options.answer !== undefined) {
-      if (item.pendingQuestion === undefined) {
+      if (item?.pendingQuestion === undefined) {
         throw new Error("the run is not waiting for an answer (no open question)");
       }
       item.pendingAnswer = options.answer;
       await this.answeredLocally(item);
-    } else if (item.pendingQuestion !== undefined && item.pendingAnswer === undefined) {
+    } else if (item?.pendingQuestion !== undefined && item.pendingAnswer === undefined) {
       if (!(await this.answerFromGitHub(item))) {
         await this.save();
         const where =
@@ -170,14 +217,15 @@ export class Pipeline {
         throw new Error(`the run is waiting for an answer: ${item.pendingQuestion}\n${where}`);
       }
     }
-    this.freshStart(item);
+    if (item !== undefined) this.freshStart(item);
     const maxItems = options.maxItems ?? this.deps.config.limits.max_items;
     this.state.status = "running";
     delete this.state.haltReason;
     delete this.state.stop;
     this.deps.host.clearStop();
     await this.save();
-    await this.event({ type: "invocation_start", item: item.index, phase: item.phase });
+    await this.event({ type: "invocation_start", item: item?.index, phase: item?.phase });
+    if (item?.issue !== undefined) await this.unflagIssue(item, item.issue);
 
     try {
       for (;;) {
@@ -186,8 +234,14 @@ export class Pipeline {
           this.deps.host.clearStop();
           return await this.pause("stop requested (STOP file)", "stop_requested");
         }
-        const current = this.state.item;
-        if (current === undefined) return await this.finish("no task left");
+        let current = this.state.item;
+        if (current === undefined) {
+          if (!this.fromIssues()) return await this.finish("no task left");
+          const picked = await this.startNextIssue();
+          if (typeof picked === "string") return await this.finish(picked);
+          if (!("index" in picked)) return picked.exit;
+          current = picked;
+        }
         const exit = await this.step(current);
         if (exit) return exit;
         if (current !== this.state.item && maxItems > 0 && this.itemsThisInvocation >= maxItems) {
@@ -239,7 +293,15 @@ export class Pipeline {
       phase: item.phase,
       startedAt: this.deps.host.now().getTime(),
     };
-    const exit = await this.runPhase(item, restarted);
+    this.stepClock = { at: this.deps.host.now().getTime(), waited: this.waitedMs };
+    let exit: Exit | undefined;
+    try {
+      exit = await this.runPhase(item, restarted);
+    } finally {
+      // A finished item already counted its time (completeItem); only a current one adds it.
+      if (this.state.item === item) item.activeMs = this.activeMs(item);
+      this.stepClock = undefined;
+    }
     delete item.inFlight;
     await this.save();
     await this.closePhase();
@@ -253,6 +315,16 @@ export class Pipeline {
     this.openPhase = undefined;
     const durationMs = this.deps.host.now().getTime() - open.startedAt;
     await this.event({ type: "phase", item: open.item, phase: open.phase, durationMs });
+  }
+
+  /** The item's active time, including the running step so far (without its waits). */
+  private activeMs(item: ItemState): number {
+    const clock = this.stepClock;
+    const step =
+      clock === undefined
+        ? 0
+        : this.deps.host.now().getTime() - clock.at - (this.waitedMs - clock.waited);
+    return Math.max(0, Math.round((item.activeMs ?? 0) + step));
   }
 
   private runPhase(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
@@ -279,6 +351,13 @@ export class Pipeline {
   // ── phases ──────────────────────────────────────────────────────────────
 
   private async implement(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
+    if (item.issue !== undefined && item.issue.claimed !== true) {
+      // nightshift stopped between picking the issue and claiming it.
+      const lost = await this.claim(item, item.issue);
+      if (lost !== undefined) {
+        return this.halt(`issue #${item.issue.number} was claimed elsewhere: ${lost}`, "halted");
+      }
+    }
     const result = await this.agentStep(item, "implement", implementResult, restarted, {
       handoff: item.handoff,
     });
@@ -289,6 +368,7 @@ export class Pipeline {
       case "blocked":
         return this.blocked(item, r.question ?? r.summary);
       case "all_done":
+        if (item.issue !== undefined) return this.setIssueAside(item, item.issue, r.summary);
         delete this.state.item;
         return this.finish(`no task left: ${r.summary}`);
       case "failed":
@@ -586,6 +666,7 @@ export class Pipeline {
 
   private async finalize(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
     const pr = this.requirePr(item);
+    if (item.issue !== undefined) return this.finalizeIssue(item, item.issue, pr, restarted);
     const aliases = Object.keys(this.deps.config.repos) as [string, ...string[]];
     const schema = finalizeResult(aliases);
     const result = await this.agentStep(item, "finalize", schema, restarted, {
@@ -623,6 +704,315 @@ export class Pipeline {
     return this.blocked(item, r.question ?? r.summary);
   }
 
+  /** Post-merge work for an issue item; the next item comes from the issues, not from Claude. */
+  private async finalizeIssue(
+    item: ItemState,
+    issue: ItemIssue,
+    pr: NonNullable<ItemState["pr"]>,
+    restarted: boolean,
+  ): Promise<Exit | undefined> {
+    if (issue.finalized !== true) {
+      const result = await this.agentStep(item, "finalize-issue", finalizeIssueResult, restarted, {
+        ...this.prVars(pr),
+        merge_sha: item.mergeSha ?? "(unknown)",
+        issue_number: issue.number,
+        issue_url: issue.url,
+        label: this.deps.config.tasks.label,
+      });
+      if (!result.ok) return result.exit;
+      if (result.value.status === "blocked") {
+        return this.blocked(item, result.value.question ?? result.value.summary);
+      }
+      issue.finalized = true;
+      await this.save();
+    }
+    await this.ensureIssueClosed(item, issue, pr);
+    await this.completeItem(item);
+    delete this.state.item;
+    return undefined;
+  }
+
+  // ── GitHub issues as the task source ───────────────────────────────────
+
+  private fromIssues(): boolean {
+    return this.deps.config.tasks.source === "github_issues";
+  }
+
+  /**
+   * Starts the next issue item, but only once a new item may start: inside active hours, within
+   * the usage limits and, with forecasts, when a typical item fits. Those gates run before the
+   * issue is claimed, so a wait or pause never holds a claim; implement then does not repeat the
+   * forecast. Returns why there is no issue left, or the exit a gate took.
+   */
+  private async startNextIssue(): Promise<ItemState | string | { exit: Exit }> {
+    const ready = await this.issueQueue();
+    if (ready.queue.length === 0) return ready.none;
+    const index = (this.state.issues?.picked ?? this.state.itemsCompleted) + 1;
+    const upcoming = newItem(index, this.deps.config.tasks.repo, "");
+    upcoming.label = "next issue";
+    const gate = await this.gates(upcoming);
+    if (!gate.ok) return { exit: gate.exit };
+    const picked = await this.pickIssue();
+    if (typeof picked !== "string") picked.startedAt = this.deps.host.now().toISOString();
+    return picked;
+  }
+
+  /** The issues nightshift may pick now, best first, and what to say when there are none. */
+  private async issueQueue(): Promise<{ slug: string; me: string; queue: Issue[]; none: string }> {
+    const { forge, config } = this.deps;
+    const { tasks } = config;
+    const slug = await forge.repoSlug(this.repoDir(tasks.repo));
+    const me = await forge.currentUser();
+    const exclude = new Set(this.state.issues?.skipped ?? []);
+    const { queue } = rankIssues(await forge.listIssues(slug, tasks.label), tasks, me, exclude);
+    return {
+      slug,
+      me,
+      queue,
+      none: `no open issue labelled "${tasks.label}" is left to do in ${slug}`,
+    };
+  }
+
+  /**
+   * Picks the next open issue, makes it the current item and claims it. Returns why there is none
+   * when no issue is left.
+   */
+  private async pickIssue(): Promise<ItemState | string> {
+    const { forge, config } = this.deps;
+    const { tasks } = config;
+    // Listed again: a gate before this may have waited for hours.
+    const { slug, me, queue, none } = await this.issueQueue();
+    this.state.issues ??= {};
+    const runIssues = this.state.issues;
+    const exclude = new Set(runIssues.skipped ?? []);
+    for (const candidate of queue) {
+      // The listing has no bodies, and the issue may have changed since: read it again.
+      const issue = await forge.issue(slug, candidate.number);
+      const why = ineligible(issue, tasks, me, exclude);
+      if (why !== undefined) {
+        this.deps.host.log(`skipping issue #${issue.number}: ${why}`);
+        continue;
+      }
+      const index = (runIssues.picked ?? this.state.itemsCompleted) + 1;
+      const instructions = runIssues.instructions?.trim() ?? "";
+      const handoff = render(this.deps.templates.issue, {
+        issue_number: issue.number,
+        issue_title: issue.title,
+        issue_url: issue.url,
+        issue_author: issue.author || "unknown",
+        issue_body: issue.body.trim() === "" ? "(no description)" : issue.body.trim(),
+        repo_slug: slug,
+        label: tasks.label,
+        instructions:
+          instructions === "" ? "" : `\n## Instructions for this run\n\n${instructions}\n`,
+      });
+      const item = newItem(index, tasks.repo, handoff);
+      item.label = `#${issue.number} ${issue.title}`;
+      item.issue = { number: issue.number, title: issue.title, url: issue.url, repoSlug: slug };
+      runIssues.picked = index;
+      this.state.item = item;
+      await this.save();
+      await this.event({ type: "issue_picked", item: index, issue: issue.url });
+      this.log(item, `picked issue ${issue.url}`);
+      const lost = await this.claim(item, item.issue, issue);
+      if (lost === undefined) return item;
+      this.log(item, `lost issue #${issue.number} to another claim (${lost}); trying the next one`);
+      const lostIssue = item.issue;
+      await this.github(item, `release issue #${issue.number}`, () =>
+        releaseClaim(forge, lostIssue),
+      );
+      exclude.add(issue.number);
+      delete this.state.item;
+      await this.save();
+    }
+    return none;
+  }
+
+  /**
+   * Claims the issue for this run: the in-progress label and/or an assignment to nightshift's
+   * account. What it adds is recorded before it is added, so a crash in between still releases it.
+   * Returns why the claim was lost to someone else, or undefined.
+   */
+  private async claim(
+    item: ItemState,
+    issue: ItemIssue,
+    current?: Issue,
+  ): Promise<string | undefined> {
+    const { forge } = this.deps;
+    const { tasks } = this.deps.config;
+    const me = await forge.currentUser();
+    const before = current ?? (await forge.issue(issue.repoSlug, issue.number));
+    if (tasks.in_progress_label !== "") issue.claimLabel ??= tasks.in_progress_label;
+    if (tasks.assign && issue.assignee === undefined && !before.assignees.includes(me)) {
+      issue.assignee = me;
+    }
+    await this.save();
+    if (issue.claimLabel !== undefined) {
+      await forge.ensureLabel(
+        issue.repoSlug,
+        issue.claimLabel,
+        IN_PROGRESS_COLOR,
+        IN_PROGRESS_DESCRIPTION,
+      );
+    }
+    await forge.editIssue(issue.repoSlug, issue.number, {
+      addLabels:
+        issue.claimLabel !== undefined && !hasLabel(before, issue.claimLabel)
+          ? [issue.claimLabel]
+          : [],
+      addAssignees:
+        issue.assignee !== undefined && !before.assignees.includes(issue.assignee)
+          ? [issue.assignee]
+          : [],
+    });
+    const after = await forge.issue(issue.repoSlug, issue.number);
+    const others = after.assignees.filter((login) => login.toLowerCase() !== me.toLowerCase());
+    if (others.length > 0) return `assigned to ${others.join(", ")}`;
+    issue.claimed = true;
+    await this.save();
+    await this.event({ type: "issue_claimed", item: item.index, issue: issue.url });
+    return undefined;
+  }
+
+  /**
+   * Claude found nothing to change for this issue: say so on the issue, label it for a human, let
+   * go of it and go on with the next issue. GitHub errors here are logged, not fatal: the run has
+   * already decided, and `skipped` keeps it from picking the issue again.
+   */
+  private async setIssueAside(
+    item: ItemState,
+    issue: ItemIssue,
+    summary: string,
+  ): Promise<undefined> {
+    const { forge } = this.deps;
+    const blocked = this.deps.config.tasks.blocked_label;
+    this.log(item, `no change needed for issue #${issue.number}; setting it aside`);
+    await this.github(item, `set issue #${issue.number} aside`, async () => {
+      const relabel =
+        blocked === ""
+          ? ""
+          : ` It is labelled \`${blocked}\` so nightshift does not pick it again; remove the label to queue it again, or close the issue.`;
+      await forge.commentIssue(
+        issue.repoSlug,
+        issue.number,
+        `**nightshift** looked at this issue and opened no pull request:\n\n${quote(summary)}\n\n${relabel.trim()}`.trim(),
+      );
+      if (blocked !== "") {
+        await forge.ensureLabel(issue.repoSlug, blocked, BLOCKED_COLOR, BLOCKED_DESCRIPTION);
+        await forge.editIssue(issue.repoSlug, issue.number, { addLabels: [blocked] });
+      }
+      await releaseClaim(forge, issue);
+    });
+    this.state.issues ??= {};
+    this.state.issues.skipped = [...(this.state.issues.skipped ?? []), issue.number];
+    await this.event({ type: "issue_set_aside", item: item.index, issue: issue.url, summary });
+    delete this.state.item;
+    await this.save();
+    return undefined;
+  }
+
+  /**
+   * After the merge: the PR's `Closes #N` normally closed the issue already; if not, close it with a
+   * comment linking the PR. The in-progress label comes off; the assignee stays as a record.
+   */
+  private async ensureIssueClosed(
+    item: ItemState,
+    issue: ItemIssue,
+    pr: NonNullable<ItemState["pr"]>,
+  ): Promise<void> {
+    const { forge } = this.deps;
+    let current = await forge.issue(issue.repoSlug, issue.number);
+    if (current.state === "OPEN") {
+      await forge.closeIssue(
+        issue.repoSlug,
+        issue.number,
+        `Fixed by ${pr.url}${item.mergeSha === undefined ? "" : ` (merged as ${item.mergeSha})`}. Closed by nightshift.`,
+      );
+      current = await forge.issue(issue.repoSlug, issue.number);
+      if (current.state !== "CLOSED") {
+        throw new Error(`issue #${issue.number} is still open after closing it`);
+      }
+      this.log(item, `closed issue ${issue.url}`);
+      await this.event({
+        type: "issue_closed",
+        item: item.index,
+        issue: issue.url,
+        by: "nightshift",
+      });
+    } else {
+      this.log(item, `issue ${issue.url} is closed`);
+      await this.event({ type: "issue_closed", item: item.index, issue: issue.url, by: "github" });
+    }
+    const label = issue.claimLabel;
+    if (label !== undefined && hasLabel(current, label)) {
+      await this.github(item, `remove label "${label}"`, () =>
+        forge.editIssue(issue.repoSlug, issue.number, { removeLabels: [label] }),
+      );
+    }
+  }
+
+  /**
+   * The run stopped on an issue item and needs a human: label the issue and say why on it (once
+   * per distinct reason, across resumes). Best effort: a GitHub failure here must not hide the stop.
+   */
+  private async noteIssue(reason: string, kind: "halted" | "blocked"): Promise<void> {
+    const item = this.state.item;
+    const issue = item?.issue;
+    if (item === undefined || issue === undefined) return;
+    const { forge } = this.deps;
+    const blocked = this.deps.config.tasks.blocked_label;
+    const post = kind === "blocked" ? item.questionPost : undefined;
+    if (post !== undefined && post.repoSlug === issue.repoSlug && post.number === issue.number) {
+      issue.noted = reason; // the question itself is on this issue already
+    }
+    if (issue.noted !== reason) {
+      await this.github(item, `comment on issue #${issue.number}`, async () => {
+        const next =
+          kind !== "blocked"
+            ? "Once the cause is fixed, `nightshift resume` continues; `nightshift run --force` abandons the run and releases this issue."
+            : post !== undefined
+              ? `It needs an answer: reply on ${post.url}, and nightshift continues.`
+              : 'It needs an answer: whoever runs nightshift continues with `nightshift resume --answer "…"`.';
+        const pr = item.pr === undefined ? "" : `\n\nPull request: ${item.pr.url}`;
+        await forge.commentIssue(
+          issue.repoSlug,
+          issue.number,
+          `**nightshift stopped** on this issue (run \`${this.state.runId}\`, step \`${item.phase}\`):\n\n${quote(reason)}${pr}\n\n${next}`,
+        );
+        issue.noted = reason;
+      });
+    }
+    if (blocked !== "" && issue.flagged === undefined) {
+      await this.github(item, `label issue #${issue.number} "${blocked}"`, async () => {
+        await forge.ensureLabel(issue.repoSlug, blocked, BLOCKED_COLOR, BLOCKED_DESCRIPTION);
+        await forge.editIssue(issue.repoSlug, issue.number, { addLabels: [blocked] });
+        issue.flagged = blocked;
+      });
+    }
+  }
+
+  /** On `resume`: a human has looked at it, so the blocked label comes off again. */
+  private async unflagIssue(item: ItemState, issue: ItemIssue): Promise<void> {
+    const label = issue.flagged;
+    if (label === undefined) return;
+    await this.github(item, `remove label "${label}"`, async () => {
+      await this.deps.forge.editIssue(issue.repoSlug, issue.number, { removeLabels: [label] });
+      delete issue.flagged;
+    });
+    await this.save();
+  }
+
+  /** Runs a GitHub update whose failure should be logged and recorded, not stop the run. */
+  private async github(item: ItemState, what: string, body: () => Promise<void>): Promise<void> {
+    try {
+      await body();
+    } catch (error) {
+      const message = (error as Error).message;
+      this.log(item, `could not ${what}: ${message}`);
+      await this.event({ type: "issue_update_failed", item: item.index, what, error: message });
+    }
+  }
+
   // ── helpers ─────────────────────────────────────────────────────────────
 
   private async agentStep<S extends z.ZodType>(
@@ -649,8 +1039,12 @@ export class Pipeline {
       };
     }
 
-    const gate = await this.gates();
+    // A new item (not a restart or resume of one already under way) starts only if the forecast
+    // says it fits in what is left of the usage limits and the active hours.
+    const fresh = template === "implement" && !restarted && item.startedAt === undefined;
+    const gate = await this.gates(fresh ? item : undefined);
     if (!gate.ok) return gate;
+    if (fresh) item.startedAt = this.deps.host.now().toISOString();
     // Cleared only once the step really starts again, so a pause before then keeps the restart.
     delete item.interruptedPhase;
 
@@ -674,8 +1068,22 @@ export class Pipeline {
     // A fresh session is only for a first implement attempt; every later step resumes the item's
     // session so Claude keeps the context of this item (and only this item).
     const resume = item.sessionId;
-    this.log(item, `${template}${resume ? "" : " (fresh session)"} · budget $${left.toFixed(2)}`);
-    let call = await this.callAgent(item, template, prompt, schema, left, resume, gate.before);
+    // A resumed session may switch models between steps; Claude Code carries the context over.
+    const settings = stepSettings(this.deps.config.agent, STEP_OF_TEMPLATE[template]);
+    this.log(
+      item,
+      `${template}${resume ? "" : " (fresh session)"} · model ${settings.model ?? "default"} · budget $${left.toFixed(2)}`,
+    );
+    let call = await this.callAgent(
+      item,
+      template,
+      prompt,
+      schema,
+      settings,
+      left,
+      resume,
+      gate.before,
+    );
     if (
       call.cut === undefined &&
       call.result.outcome === "error" &&
@@ -695,6 +1103,7 @@ export class Pipeline {
         template,
         prompt,
         schema,
+        settings,
         left - call.result.costUsd,
         undefined,
         again.before,
@@ -767,6 +1176,7 @@ export class Pipeline {
     template: TemplateName,
     prompt: string,
     schema: z.ZodType,
+    settings: StepSettings,
     maxBudgetUsd: number,
     resumeSessionId: string | undefined,
     usageBefore: UsageWindows | undefined,
@@ -783,6 +1193,9 @@ export class Pipeline {
         prompt,
         schema: toJsonSchema(schema),
         ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+        ...(settings.model === undefined ? {} : { model: settings.model }),
+        maxTurns: settings.maxTurns,
+        permissionMode: settings.permissionMode,
         maxBudgetUsd,
         artifactPath: this.artifact(item, `${template}-${attempt}.jsonl`),
         signal: watch === undefined ? this.signal : AbortSignal.any([this.signal, guard.signal]),
@@ -804,6 +1217,7 @@ export class Pipeline {
       type: "agent",
       item: item.index,
       step: template,
+      ...(settings.model === undefined ? {} : { model: settings.model }),
       outcome: result.outcome,
       costUsd: result.costUsd,
       sessionId: result.sessionId,
@@ -881,14 +1295,97 @@ export class Pipeline {
    * Everything that must hold before Claude work starts: inside active hours and within the usage
    * limits. A long usage wait can end outside active hours, so both are checked until both hold.
    */
-  private async gates(): Promise<UsageGate> {
+  private async gates(newItem?: ItemState): Promise<UsageGate> {
     for (;;) {
       const outside = await this.scheduleGate();
       if (outside) return { ok: false, exit: outside };
       const gate = await this.usageGate();
       if (!gate.ok) return gate;
-      if (isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) return gate;
+      if (!isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) continue;
+      if (newItem === undefined) return gate;
+      const fit = await this.forecastGate(newItem, gate.before);
+      if (fit === undefined) return gate;
+      if (fit !== "waited") return { ok: false, exit: fit };
     }
+  }
+
+  /** `[usage] start_item_only_if_it_fits`, which defaults to on when limits or hours are set. */
+  private forecastEnabled(): boolean {
+    const { usage, schedule } = this.deps.config;
+    return (
+      usage.start_item_only_if_it_fits ??
+      (limitsEnabled(this.usageLimits()) || schedule.active_hours.length > 0)
+    );
+  }
+
+  /**
+   * Before a new item: estimates a typical item from history and, when it would not fit in what is
+   * left of the usage limits or the active hours, waits for the window reset or the next active
+   * range (or pauses, following on_limit / outside_hours) instead of starting an item that would
+   * be cut half-way. Returns undefined to start, "waited" to check everything again, or an exit.
+   */
+  private async forecastGate(
+    item: ItemState,
+    windows: UsageWindows | undefined,
+  ): Promise<Exit | "waited" | undefined> {
+    if (!this.forecastEnabled()) return undefined;
+    const { usage, schedule, dir } = this.deps.config;
+    const now = this.deps.host.now();
+    const estimate = estimateItem(await readHistory(dir), usage.forecast_percentile);
+    const decision = decideStart({
+      estimate,
+      limits: this.usageLimits(),
+      tally: this.state.usage?.tally ?? {},
+      windows,
+      ranges: schedule.active_hours,
+      now,
+    });
+    this.log(item, `forecast: ${decision.reason}`);
+    await this.event({
+      type: "forecast",
+      item: item.index,
+      start: decision.start,
+      reason: decision.reason,
+    });
+    if (decision.start) return undefined;
+
+    let stopped: Exit | undefined;
+    if (decision.kind === "usage") {
+      const label = WINDOW_LABEL[decision.window];
+      const resetsAt = decision.until === undefined ? Number.NaN : Date.parse(decision.until);
+      const until = Math.max(
+        Number.isNaN(resetsAt) ? 0 : resetsAt + USAGE_RESET_GRACE_MS,
+        now.getTime() + usage.check_seconds * 1000,
+      );
+      if (usage.on_limit === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before the ${label} window resets ${formatTime(decision.until, now)}`,
+          "forecast_usage",
+          new Date(until),
+        );
+      }
+      stopped = await this.sleepUntil(
+        until,
+        `forecast: ${decision.reason}`,
+        `for the ${label} window to reset before starting a new item`,
+        "forecast_wait",
+      );
+    } else {
+      if (schedule.outside_hours === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before active hours start again ${formatTime(decision.until.toISOString(), now)}`,
+          "forecast_hours",
+          decision.until,
+        );
+      }
+      stopped = await this.sleepUntil(
+        decision.until.getTime(),
+        `forecast: ${decision.reason}`,
+        "for the next active hours before starting a new item",
+        "forecast_wait",
+      );
+    }
+    return stopped ?? "waited";
   }
 
   /**
@@ -926,9 +1423,11 @@ export class Pipeline {
     this.state.waiting = { until: untilIso, reason };
     await this.save();
     await this.event({ type: eventType, reason, until: untilIso });
+    const started = this.deps.host.now().getTime();
     try {
       return await this.waitUntil(until);
     } finally {
+      this.waitedMs += Math.max(0, this.deps.host.now().getTime() - started);
       delete this.state.waiting;
       await this.save();
     }
@@ -1042,8 +1541,9 @@ export class Pipeline {
   }
 
   /**
-   * Live progress of a Claude step: every tool call is logged, and `status` sees the step, its
-   * tool count and the latest call (state is saved at most every PROGRESS_SAVE_MS while it runs).
+   * Live progress of a Claude step: every tool call is logged and appended to the run's progress
+   * feed (for `watch`), and `status` sees the step, its tool count and the latest call (state is
+   * saved at most every PROGRESS_SAVE_MS while it runs).
    */
   private trackActivity(
     item: ItemState,
@@ -1061,6 +1561,16 @@ export class Pipeline {
         activity.last = detail === "" ? name : `${name} ${detail}`;
         activity.lastAt = now().toISOString();
         this.log(item, `${template} · ${activity.last}`);
+        // The feed is only for `nightshift watch`; failing to write it must not fail the step.
+        this.deps.store
+          .progress(this.state.runId, {
+            at: activity.lastAt,
+            item: item.index,
+            step: template,
+            tool: name,
+            detail,
+          })
+          .catch(() => {});
         if (now().getTime() - lastSave >= PROGRESS_SAVE_MS) {
           lastSave = now().getTime();
           this.save().catch(() => {});
@@ -1127,7 +1637,15 @@ export class Pipeline {
       pr: item.pr?.url,
       mergeSha: item.mergeSha,
       costUsd: item.costUsd,
-      usagePoints: item.usagePoints,
+      // For forecasts: what the item used of each window (when usage is measured), and its time.
+      ...(limitsEnabled(this.usageLimits())
+        ? {
+            usagePoints: Object.fromEntries(
+              USAGE_WINDOWS.map((w) => [w, item.usagePoints?.[w] ?? 0]),
+            ),
+          }
+        : {}),
+      activeMs: this.activeMs(item),
     });
   }
 
@@ -1243,6 +1761,8 @@ export class Pipeline {
       at: this.deps.host.now().toISOString(),
       ...(resumeAt === undefined ? {} : { resumeAt: resumeAt.toISOString() }),
     };
+    // A planned pause or Ctrl-C is no news for the issue; everything else needs a human.
+    if (kind !== "paused" && !this.signal.aborted) await this.noteIssue(reason, kind);
     await this.save();
     await this.closePhase();
     await this.event({
@@ -1308,8 +1828,12 @@ export class Pipeline {
   }
 
   private repoPath(item: ItemState): string {
-    const dir = this.deps.config.repos[item.repo];
-    if (dir === undefined) throw new Error(`unknown repo alias "${item.repo}"`);
+    return this.repoDir(item.repo);
+  }
+
+  private repoDir(alias: string): string {
+    const dir = this.deps.config.repos[alias];
+    if (dir === undefined) throw new Error(`unknown repo alias "${alias}"`);
     return dir;
   }
 

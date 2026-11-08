@@ -36,7 +36,7 @@ export function questionBody(
   const quoted = question
     .trim()
     .split("\n")
-    .map((line) => `> ${line.replaceAll("@", "@​")}`)
+    .map((line) => `> ${line.replaceAll("@", "@\u200b")}`)
     .join("\n");
   const who = users.map((u) => `@${u}`).join(" or ");
   return [
@@ -45,7 +45,7 @@ export function questionBody(
     "",
     quoted,
     "",
-    `Reply to this ${kind === "issue" ? "issue" : "pull request"} with a comment that holds just your answer. ` +
+    `Reply to this ${kind === "pr_comment" ? "pull request" : "issue"} with a comment that holds just your answer. ` +
       `Comments from ${who} posted after this one are taken as the answer; nightshift picks it up ` +
       "with its background service, or on the next `nightshift resume`, and reacts with 👍. " +
       'You can also answer locally: `nightshift resume --answer "…"`.',
@@ -58,8 +58,9 @@ function issueTitle(item: ItemState): string {
 }
 
 /**
- * Posts the question as a comment on the item's PR, or opens an issue in `repoSlug` when there is
- * no PR yet. Returns where it was posted; throws when GitHub refuses.
+ * Posts the question as a comment on the item's PR; with no PR yet, on the GitHub issue the item
+ * works on (`[tasks] source = "github_issues"`), or else in a new issue in `repoSlug`. Returns
+ * where it was posted; throws when GitHub refuses.
  */
 export async function postQuestion(
   forge: Forge,
@@ -72,11 +73,23 @@ export async function postQuestion(
   const users = await allowedUsers(config, forge);
   if (item.pr !== undefined) {
     const body = questionBody(question, { runId, item, kind: "pr_comment", users });
-    const posted = await forge.postComment(item.pr.repoSlug, item.pr.number, body);
+    const posted = await forge.commentIssue(item.pr.repoSlug, item.pr.number, body);
     return {
       kind: "pr_comment",
       repoSlug: item.pr.repoSlug,
       number: item.pr.number,
+      id: posted.id,
+      url: posted.url,
+      postedAt: posted.createdAt,
+    };
+  }
+  if (item.issue !== undefined) {
+    const body = questionBody(question, { runId, item, kind: "issue_comment", users });
+    const posted = await forge.commentIssue(item.issue.repoSlug, item.issue.number, body);
+    return {
+      kind: "issue_comment",
+      repoSlug: item.issue.repoSlug,
+      number: item.issue.number,
       id: posted.id,
       url: posted.url,
       postedAt: posted.createdAt,
@@ -138,8 +151,9 @@ export async function findAnswer(
 }
 
 /**
- * Tells the human the answer was picked up: 👍 on each reply, and an issue opened for the question
- * is closed. Best effort; returns the problems instead of throwing.
+ * Tells the human the answer was picked up: 👍 on each reply, and an issue opened just for the
+ * question is closed (never the issue an item works on). Best effort; returns the problems
+ * instead of throwing.
  */
 export async function acknowledge(
   forge: Forge,
@@ -147,6 +161,13 @@ export async function acknowledge(
   answer: Answer | undefined,
 ): Promise<string[]> {
   const problems: string[] = [];
+  const attempt = async (what: string, action: () => Promise<unknown>) => {
+    try {
+      await action();
+    } catch (error) {
+      problems.push(`could not ${what} ${post.url}: ${(error as Error).message}`);
+    }
+  };
   for (const comment of answer?.comments ?? []) {
     try {
       await forge.addReaction(post.repoSlug, comment.id, "+1");
@@ -154,24 +175,15 @@ export async function acknowledge(
       problems.push(`could not react to ${comment.url}: ${(error as Error).message}`);
     }
   }
-  if (answer === undefined) {
-    // Answered from the terminal: say so where the question was asked.
-    try {
-      await forge.postComment(
-        post.repoSlug,
-        post.number,
-        `${MARKER_PREFIX}answered -->\nAnswered from the terminal (\`nightshift resume --answer\`); nightshift continues.`,
-      );
-    } catch (error) {
-      problems.push(`could not comment on ${post.url}: ${(error as Error).message}`);
-    }
-  }
+  const note =
+    answer === undefined
+      ? `${MARKER_PREFIX}answered -->\nAnswered from the terminal (\`nightshift resume --answer\`); nightshift continues.`
+      : `${MARKER_PREFIX}answered -->\nAnswer from @${answer.by.join(", @")} picked up; nightshift continues.`;
   if (post.kind === "issue") {
-    try {
-      await forge.closeIssue(post.repoSlug, post.number);
-    } catch (error) {
-      problems.push(`could not close ${post.url}: ${(error as Error).message}`);
-    }
+    await attempt("close", () => forge.closeIssue(post.repoSlug, post.number, note));
+  } else if (answer === undefined) {
+    // Answered from the terminal: say so where the question was asked.
+    await attempt("comment on", () => forge.commentIssue(post.repoSlug, post.number, note));
   }
   return problems;
 }

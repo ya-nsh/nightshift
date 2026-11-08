@@ -25,6 +25,13 @@ const AFTER_RESUME_MS = 5_000;
 /** The allowed users are re-read (`gh api user`) at most this often. */
 const USERS_TTL_MS = 60 * 60_000;
 
+const PAUSE_LABEL = {
+  usage_limit: "usage limit",
+  outside_hours: "outside active hours",
+  forecast_usage: "forecast: a typical item would not fit the usage limits",
+  forecast_hours: "forecast: a typical item would not fit the active hours",
+} as const;
+
 export type Decision =
   | { action: "resume"; why: string }
   | { action: "post_question"; why: string }
@@ -62,8 +69,10 @@ export function decide(
   }
   switch (stop.cause) {
     case "usage_limit":
-    case "outside_hours": {
-      const what = stop.cause === "usage_limit" ? "usage limit" : "outside active hours";
+    case "outside_hours":
+    case "forecast_usage":
+    case "forecast_hours": {
+      const what = PAUSE_LABEL[stop.cause];
       const at = stop.resumeAt === undefined ? Number.NaN : Date.parse(stop.resumeAt);
       if (Number.isNaN(at) || at <= now) {
         return { action: "resume", why: `paused (${what}), which has cleared` };

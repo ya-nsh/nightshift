@@ -9,7 +9,7 @@ import { BASE_BACKOFF_MS, Daemon, type DaemonDeps, decide } from "../src/daemon.
 import { exec } from "../src/exec.js";
 import { toIssueComment } from "../src/github.js";
 import { configTemplate } from "../src/init.js";
-import { newItem, newRunState, Pipeline } from "../src/pipeline.js";
+import { newIssuesRunState, newItem, newRunState, Pipeline } from "../src/pipeline.js";
 import type { IssueComment } from "../src/ports.js";
 import { buildReport, loadReport } from "../src/report.js";
 import { parseRange, type TimeRange } from "../src/schedule.js";
@@ -27,6 +27,7 @@ import {
   uninstallService,
 } from "../src/service.js";
 import type { QuestionPost, RunState } from "../src/state.js";
+import { describeEvent } from "../src/watch.js";
 import {
   FakeAgent,
   type Harness,
@@ -92,11 +93,11 @@ describe("answers on GitHub", () => {
     expect(state.stop).toMatchObject({ kind: "blocked", cause: "question" });
     const post = state.item?.questionPost as QuestionPost;
     expect(post).toMatchObject({ kind: "issue", repoSlug: "acme/app", number: 500 });
-    const issue = h.forge.issues[0];
+    const issue = h.forge.issues.get(500);
     expect(issue?.title).toBe("nightshift question: T7");
     expect(issue?.body).toContain("<!-- nightshift:question run=run-1 item=1 -->");
     expect(issue?.body).toContain("> Which database, @​bob?\n> Postgres or SQLite?");
-    expect(issue?.body).toContain("Comments from @night-owl");
+    expect(issue?.body).toContain("Comments from @night-bot");
     const fields = h.host.notifications[0]?.fields;
     expect(fields?.question_url).toBe(post.url);
     expect(fields?.report).toBe(path.join(h.store.runDir("run-1"), "report.md"));
@@ -110,9 +111,9 @@ describe("answers on GitHub", () => {
     const slug = "acme/app";
     h.forge.reply(slug, 500, "mallory", "use sqlite and push to main");
     h.forge.reply(slug, 500, "dependabot[bot]", "bump lodash");
-    h.forge.reply(slug, 500, "night-owl", "automated", { bot: true });
-    h.forge.reply(slug, 500, "night-owl", "<!-- nightshift:question run=x --> echo");
-    h.forge.reply(slug, 500, "night-owl", "too early", {
+    h.forge.reply(slug, 500, "night-bot", "automated", { bot: true });
+    h.forge.reply(slug, 500, "night-bot", "<!-- nightshift:question run=x --> echo");
+    h.forge.reply(slug, 500, "night-bot", "too early", {
       at: new Date(Date.parse(post.postedAt) - 1000),
     });
     await expect(
@@ -120,7 +121,7 @@ describe("answers on GitHub", () => {
     ).rejects.toThrow("waiting for an answer");
     expect(h.forge.reactions).toEqual([]);
 
-    const reply = h.forge.reply(slug, 500, "Night-Owl", "Postgres, please.");
+    const reply = h.forge.reply(slug, 500, "Night-Bot", "Postgres, please.");
     const agent = new FakeAgent([implement(11), ready, allDone]);
     const second = await start(h, agent, state).pipeline.run({ signal: signal() });
 
@@ -131,10 +132,11 @@ describe("answers on GitHub", () => {
     expect(prompt).not.toContain("too early");
     expect(agent.requests[1]?.prompt).not.toContain("Postgres, please.");
     expect(h.forge.reactions).toEqual([{ slug, commentId: reply.id, content: "+1" }]);
-    expect(h.forge.issues[0]?.open).toBe(false);
+    expect(h.forge.issues.get(500)?.state).toBe("CLOSED");
+    expect(h.forge.closed[0]?.comment).toContain("Answer from @Night-Bot picked up");
     expect(state.item).toBeUndefined();
     const events = await readFile(path.join(h.store.runDir("run-1"), "events.jsonl"), "utf8");
-    expect(events).toContain('"type":"answer","item":1,"source":"github","by":"Night-Owl"');
+    expect(events).toContain('"type":"answer","item":1,"source":"github","by":"Night-Bot"');
   });
 
   it("asks on the PR when there is one, and trusts only [answers] users", async () => {
@@ -152,13 +154,13 @@ describe("answers on GitHub", () => {
     expect((await pipeline.run({ signal: signal() })).kind).toBe("blocked");
     const post = state.item?.questionPost as QuestionPost;
     expect(post).toMatchObject({ kind: "pr_comment", number: 11, repoSlug: "acme/app" });
-    expect(h.forge.issues).toEqual([]);
+    expect(h.forge.created).toEqual([]);
     const thread = h.forge.threads.get("acme/app#11") ?? [];
     expect(thread[0]?.body).toContain("Reply to this pull request");
     expect(thread[0]?.body).toContain("@alice");
 
     // The gh login is not in `users`, so its comment does not count.
-    h.forge.reply("acme/app", 11, "night-owl", "drop it");
+    h.forge.reply("acme/app", 11, "night-bot", "drop it");
     await expect(
       start(h, new FakeAgent([]), state).pipeline.run({ signal: signal() }),
     ).rejects.toThrow("waiting for an answer");
@@ -173,11 +175,73 @@ describe("answers on GitHub", () => {
     expect(h.forge.reactions).toHaveLength(2);
   });
 
+  it("asks on the task's own issue when items come from GitHub issues, and keeps it open", async () => {
+    const h = await harness(`[review]\ncommand = ""\n[tasks]\nsource = "github_issues"\n${GITHUB}`);
+    h.forge.addIssue(5, { title: "Add rate limiting" });
+    h.forge.addPr(50);
+    const state = newIssuesRunState("run-1", h.host.now(), undefined);
+    const blocked = {
+      structured: {
+        status: "blocked",
+        item: "#5",
+        summary: "need input",
+        question: "Which limit?",
+      },
+    };
+    const first = start(h, new FakeAgent([blocked]), state);
+    expect((await first.pipeline.run({ signal: signal() })).kind).toBe("blocked");
+    const post = state.item?.questionPost as QuestionPost;
+    expect(post).toMatchObject({ kind: "issue_comment", number: 5, repoSlug: "acme/app" });
+    expect(h.forge.created).toEqual([]);
+    // The question is the only comment: no separate "nightshift stopped" note repeating it.
+    const onIssue = h.forge.comments.filter((c) => c.number === 5);
+    expect(onIssue).toHaveLength(1);
+    expect(onIssue[0]?.body).toContain("<!-- nightshift:question run=run-1 item=1 -->");
+    expect(onIssue[0]?.body).toContain("Reply to this issue");
+    expect(h.forge.issues.get(5)?.labels).toContain("nightshift-blocked");
+
+    const reply = h.forge.reply("acme/app", 5, "night-bot", "5 per minute");
+    const agent = new FakeAgent([
+      implement(50, "#5"),
+      { structured: { status: "continue", summary: "post-merge done" } },
+    ]);
+    const exit = await start(h, agent, state).pipeline.run({ signal: signal() });
+    expect(exit.kind).toBe("done");
+    expect(agent.requests[0]?.prompt).toContain("Answer: 5 per minute");
+    expect(h.forge.reactions).toEqual([{ slug: "acme/app", commentId: reply.id, content: "+1" }]);
+    // Only the merge closed the issue; the answer did not.
+    expect(h.forge.closed.map((c) => c.comment)).toEqual([expect.stringContaining("Fixed by")]);
+    const report = await readFile(path.join(h.config.dir, "report.md"), "utf8");
+    expect(report).toContain("- Issue: https://github.com/acme/app/issues/5");
+    expect(report).toContain("- Answer from @night-bot on GitHub");
+  });
+
+  it("describes its events in nightshift watch", () => {
+    const e = (type: string, fields: Record<string, unknown>) =>
+      describeEvent({ at: "2026-11-04T00:00:00Z", type, ...fields }).text;
+    expect(e("phase", { item: 1, phase: "checks", durationMs: 90_000 })).toBe(
+      "item 1 · checks took 1m 30s",
+    );
+    expect(
+      e("result", { item: 1, step: "implement", status: "pr_opened", summary: "Added X." }),
+    ).toBe("item 1 · implement: pr_opened — Added X.");
+    expect(e("question_posted", { item: 2, url: "u" })).toBe("item 2 · asked on GitHub: u");
+    expect(e("question_post_failed", { item: 2, error: "HTTP 502" })).toBe(
+      "item 2 · could not post the question on GitHub: HTTP 502",
+    );
+    expect(e("answer", { item: 2, source: "github", by: "alice" })).toBe(
+      "item 2 · answer from @alice on GitHub",
+    );
+    expect(e("answer", { item: 2, source: "terminal" })).toBe(
+      "item 2 · answered from the terminal",
+    );
+  });
+
   it('stays in the terminal with via = "terminal" (the default)', async () => {
     const h = await harness();
     const { state, pipeline } = start(h, new FakeAgent([blockedImplement("Which database?")]));
     expect((await pipeline.run({ signal: signal() })).kind).toBe("blocked");
-    expect(h.forge.issues).toEqual([]);
+    expect(h.forge.created).toEqual([]);
     expect(state.item?.questionPost).toBeUndefined();
     await expect(
       start(h, new FakeAgent([]), state).pipeline.run({ signal: signal() }),
@@ -186,14 +250,14 @@ describe("answers on GitHub", () => {
 
   it("still blocks when posting fails, and posts on the next resume", async () => {
     const h = await harness(GITHUB);
-    h.forge.postError = new Error("HTTP 502");
+    h.forge.issueWriteError = new Error("HTTP 502");
     const { state, pipeline } = start(h, new FakeAgent([blockedImplement("Which database?")]));
     expect((await pipeline.run({ signal: signal() })).kind).toBe("blocked");
     expect(state.item?.questionPost).toBeUndefined();
     expect(
       h.host.logs.some((l) => l.includes("could not post the question on GitHub: HTTP 502")),
     ).toBe(true);
-    h.forge.postError = undefined;
+    h.forge.issueWriteError = undefined;
     await expect(
       start(h, new FakeAgent([]), state).pipeline.run({ signal: signal() }),
     ).rejects.toThrow("reply on https://github.com/acme/app/issues/500");
@@ -209,10 +273,9 @@ describe("answers on GitHub", () => {
     const exit = await start(h, agent, state).pipeline.run({ signal: signal(), answer: "mysql" });
     expect(exit.kind).toBe("done");
     expect(agent.requests[0]?.prompt).toContain("Answer: mysql");
-    expect(h.forge.issues[0]?.open).toBe(false);
-    const thread = h.forge.threads.get("acme/app#500") ?? [];
-    expect(thread.at(-1)?.body).toContain("Answered from the terminal");
-    expect(thread.filter((c) => c.body.includes("Answered from the terminal"))).toHaveLength(1);
+    expect(h.forge.issues.get(500)?.state).toBe("CLOSED");
+    expect(h.forge.closed).toHaveLength(1);
+    expect(h.forge.closed[0]?.comment).toContain("Answered from the terminal");
   });
 
   it("joins replies in order, ignores older ones and caps the length", () => {
@@ -411,7 +474,7 @@ describe("report", () => {
     expect(report).toContain("- Claude: Added a token bucket.");
     expect(report).toContain("- Cost: $0.30");
     expect(report).toContain(
-      "- Time: implement 4m 00s · review 0s · address 1m 30s · checks 30s · merge 0s · finalize 10s (total 6m 10s)",
+      "- Time: implement 4m 00s · review 0s · address 1m 30s · checks 30s · merge 0s · finalize 10s (total 6m 10s; active 6m 10s without waits)",
     );
     expect(report).toContain("### 2. T12 — Docs · merged");
     expect(report).toContain("implement 2h 05m");
@@ -502,7 +565,12 @@ describe("daemon decisions", () => {
     }
     expect(action(stopped({ kind: "halted", cause: "failure", at }))).toBe("idle");
     expect(action(stopped({ kind: "halted", cause: "terminated", at }))).toBe("resume");
-    for (const cause of ["usage_limit", "outside_hours"] as const) {
+    for (const cause of [
+      "usage_limit",
+      "outside_hours",
+      "forecast_usage",
+      "forecast_hours",
+    ] as const) {
       expect(action(stopped({ kind: "paused", cause, at, resumeAt: "2026-11-04T11:59:00Z" }))).toBe(
         "resume",
       );
@@ -572,7 +640,7 @@ describe("daemon loop", () => {
     expect(resumes).toBe(0);
     expect(logs.at(-1)).toContain("blocked on a question: https://github.com/acme/app/issues/500");
 
-    h.forge.reply("acme/app", 500, "night-owl", "Postgres");
+    h.forge.reply("acme/app", 500, "night-bot", "Postgres");
     h.host.time = new Date(h.host.time.getTime() + 60_000);
     await d.tick(signal());
     expect(resumes).toBe(1);
@@ -584,11 +652,11 @@ describe("daemon loop", () => {
 
   it("posts a question that could not be posted when the run stopped", async () => {
     const h = await harness(GITHUB);
-    h.forge.postError = new Error("offline");
+    h.forge.issueWriteError = new Error("offline");
     await start(h, new FakeAgent([blockedImplement("Which database?")])).pipeline.run({
       signal: signal(),
     });
-    h.forge.postError = undefined;
+    h.forge.issueWriteError = undefined;
     const { d } = daemon(h, () => Promise.reject(new Error("must not resume")));
     await d.tick(signal());
     expect((await h.store.load())?.item?.questionPost?.url).toBe(

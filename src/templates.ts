@@ -8,8 +8,11 @@ export const TEMPLATE_NAMES = [
   "fix-checks",
   "resolve-conflicts",
   "finalize",
+  "issue",
+  "finalize-issue",
   "answer",
   "restarted",
+  "plan",
 ] as const;
 export type TemplateName = (typeof TEMPLATE_NAMES)[number];
 

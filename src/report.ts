@@ -2,6 +2,7 @@ import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { RunState, StateStore } from "./state.js";
 import { USAGE_WINDOWS, type UsageWindow, WINDOW_LABEL } from "./usage.js";
+import { formatDuration } from "./watch.js";
 
 /**
  * The morning report: what a run did, from its event journal plus the live state. Written on every
@@ -29,6 +30,19 @@ interface ItemReport {
   /** Milliseconds per phase, in the order phases first ran. */
   steps: Map<string, number>;
   answeredBy?: string;
+  /** The GitHub issue the item worked on (`[tasks] source = "github_issues"`). */
+  issue?: string;
+  /** Claude found nothing to change for the issue, so it was set aside. */
+  setAside?: string;
+  /** Time on the item without usage, schedule and forecast waits (from item_done). */
+  activeMs?: number;
+}
+
+interface ForecastEvent {
+  at: string;
+  item: number | undefined;
+  start: boolean;
+  reason: string;
 }
 
 interface StopEvent {
@@ -78,6 +92,7 @@ export function buildReport(state: RunState, events: readonly Event[], now: Date
     return item;
   };
   const stops: StopEvent[] = [];
+  const forecasts: ForecastEvent[] = [];
 
   for (const e of events) {
     const item = itemAt(e.item);
@@ -109,6 +124,22 @@ export function buildReport(state: RunState, events: readonly Event[], now: Date
       case "answer":
         if (item && typeof e.by === "string") item.answeredBy = e.by;
         break;
+      case "issue_picked":
+        if (item && typeof e.issue === "string") item.issue = e.issue;
+        break;
+      case "issue_set_aside":
+        if (!item) break;
+        if (typeof e.issue === "string") item.issue = e.issue;
+        item.setAside = typeof e.summary === "string" ? e.summary : "";
+        break;
+      case "forecast":
+        forecasts.push({
+          at: typeof e.at === "string" ? e.at : "",
+          item: typeof e.item === "number" ? e.item : undefined,
+          start: e.start !== false,
+          reason: typeof e.reason === "string" ? e.reason : "",
+        });
+        break;
       case "item_done":
         if (!item) break;
         item.done = true;
@@ -116,6 +147,7 @@ export function buildReport(state: RunState, events: readonly Event[], now: Date
         if (typeof e.pr === "string") item.pr = e.pr;
         if (typeof e.mergeSha === "string") item.mergeSha = e.mergeSha;
         if (typeof e.costUsd === "number") item.costUsd = e.costUsd;
+        if (typeof e.activeMs === "number") item.activeMs = e.activeMs;
         if (e.usagePoints !== undefined) {
           item.pointsFinal = {};
           addPoints(item.pointsFinal, e.usagePoints);
@@ -141,6 +173,8 @@ export function buildReport(state: RunState, events: readonly Event[], now: Date
     if (current.label !== undefined) item.label = current.label;
     if (current.pr !== undefined) item.pr = current.pr.url;
     if (current.mergeSha !== undefined) item.mergeSha = current.mergeSha;
+    if (current.issue !== undefined) item.issue = current.issue.url;
+    if (current.activeMs !== undefined) item.activeMs = current.activeMs;
     item.costUsd = current.costUsd;
     if (current.usagePoints !== undefined) item.pointsFinal = { ...current.usagePoints };
   }
@@ -167,6 +201,17 @@ export function buildReport(state: RunState, events: readonly Event[], now: Date
   const ordered = [...items.values()].sort((a, b) => a.index - b.index);
   if (ordered.length === 0) lines.push("No items yet.", "");
   for (const item of ordered) lines.push(...itemSection(item, state), "");
+
+  const held = forecasts.filter((f) => !f.start);
+  const lastForecast = forecasts.at(-1);
+  if (lastForecast !== undefined) {
+    lines.push("## Forecast", "", `- Latest: ${lastForecast.reason}`);
+    for (const f of held) {
+      const what = f.item === undefined ? "a new item" : `item ${f.item}`;
+      lines.push(`- ${formatDate(f.at)} · held back ${what}: ${f.reason}`);
+    }
+    lines.push("");
+  }
 
   const history = stops.filter((s) => s.kind !== "done");
   if (history.length > 0) {
@@ -231,6 +276,7 @@ function itemSection(item: ItemReport, state: RunState): string[] {
   const current = state.item?.index === item.index ? state.item : undefined;
   let status: string;
   if (item.done) status = item.mergeSha ? "merged" : "done";
+  else if (item.setAside !== undefined) status = "set aside (no change needed)";
   else if (current === undefined) status = "not finished";
   else if (state.status === "halted" && state.stop?.kind === "blocked") status = "blocked";
   else if (state.status === "halted" && state.stop?.kind === "halted") {
@@ -238,9 +284,11 @@ function itemSection(item: ItemReport, state: RunState): string[] {
   } else status = `in progress (${current.phase})`;
   const lines = [`### ${item.index}. ${item.label ?? "(no label yet)"} · ${status}`, ""];
   if (item.repo !== undefined) lines.push(`- Repo: ${item.repo}`);
+  if (item.issue !== undefined) lines.push(`- Issue: ${item.issue}`);
   if (item.pr !== undefined) lines.push(`- PR: ${item.pr}`);
   if (item.mergeSha !== undefined) lines.push(`- Merged as \`${item.mergeSha}\``);
-  if (item.summary !== undefined) lines.push(`- Claude: ${oneLine(item.summary)}`);
+  const summary = item.setAside || item.summary;
+  if (summary !== undefined && summary !== "") lines.push(`- Claude: ${oneLine(summary)}`);
   if (item.answeredBy !== undefined) lines.push(`- Answer from @${item.answeredBy} on GitHub`);
   const points = formatPoints(item.pointsFinal ?? item.points);
   lines.push(`- Cost: $${item.costUsd.toFixed(2)}${points === "" ? "" : ` · usage: ${points}`}`);
@@ -251,7 +299,11 @@ function itemSection(item: ItemReport, state: RunState): string[] {
       total += ms;
       parts.push(`${phase} ${formatDuration(ms)}`);
     }
-    lines.push(`- Time: ${parts.join(" · ")} (total ${formatDuration(total)})`);
+    const active =
+      item.activeMs === undefined ? "" : `; active ${formatDuration(item.activeMs)} without waits`;
+    lines.push(`- Time: ${parts.join(" · ")} (total ${formatDuration(total)}${active})`);
+  } else if (item.activeMs !== undefined) {
+    lines.push(`- Time: active ${formatDuration(item.activeMs)}`);
   }
   return lines;
 }
@@ -271,14 +323,6 @@ function formatPoints(points: Points | undefined): string {
   return USAGE_WINDOWS.filter((w) => (points[w] ?? 0) > 0)
     .map((w) => `${points[w]} points of the ${WINDOW_LABEL[w]} window`)
     .join(", ");
-}
-
-export function formatDuration(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
-  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 /** Local time as `YYYY-MM-DD HH:MM`. */
