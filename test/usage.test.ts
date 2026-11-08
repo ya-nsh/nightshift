@@ -92,6 +92,7 @@ describe("usage config", () => {
       weekly_max: 0,
       on_limit: "wait",
       check_seconds: 60,
+      forecast_percentile: 50,
     });
     expect(() => parseConfig('[repos]\na = "."\n[usage]\nsession_share = 101', "/h")).toThrow(
       ConfigError,
@@ -337,7 +338,7 @@ describe("pipeline with a usage budget", () => {
     // The restarted implement runs in the next window, told that it was interrupted.
     expect(agent.requests[1]?.prompt).toContain("was interrupted");
     expect(agent.requests[1]?.resumeSessionId).toBeUndefined();
-    expect(state.items).toEqual([]);
+    expect(state.item).toBeUndefined();
     expect(state.usage?.tally.five_hour?.used).toBe(6);
     const events = await readFile(path.join(h.store.runDir("run-1"), "events.jsonl"), "utf8");
     expect(events).toContain('"type":"usage_cut"');
@@ -348,7 +349,7 @@ describe("pipeline with a usage budget", () => {
     h.forge.addPr(11);
     const plan = new SimulatedPlan(h.host);
     const state = newRunState("run-1", h.host.now(), "main", "do task one");
-    if (state.items[0]) state.items[0].pendingQuestion = "which database?";
+    if (state.item) state.item.pendingQuestion = "which database?";
     state.status = "halted";
     const agent = new FakeAgent([
       async (request) => {
@@ -363,8 +364,8 @@ describe("pipeline with a usage budget", () => {
     });
     expect(first.kind).toBe("paused");
     expect(first.reason).toContain("usage limit: nightshift used 20 of its 15-point share");
-    expect(state.items[0]?.pendingAnswer).toBe("postgres");
-    expect(state.items[0]?.interruptedPhase).toBe("implement");
+    expect(state.item?.pendingAnswer).toBe("postgres");
+    expect(state.item?.interruptedPhase).toBe("implement");
 
     h.host.time = new Date(h.host.time.getTime() + FIVE_HOURS_MS);
     const resumed = new FakeAgent([implement(11), ready, allDone]);
@@ -418,7 +419,7 @@ describe("pipeline with a usage budget", () => {
     });
     expect(exit.kind).toBe("paused");
     expect(exit.reason).toContain("nightshift used 7 of its 5-point share");
-    expect(state.items[0]?.phase).toBe("address");
+    expect(state.item?.phase).toBe("address");
   });
 
   it("stops waiting when asked to", async () => {

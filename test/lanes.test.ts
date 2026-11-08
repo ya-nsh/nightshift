@@ -2,10 +2,16 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { parseConfig } from "../src/config.js";
+import { decide, progress } from "../src/daemon.js";
 import { exec } from "../src/exec.js";
-import { newItem, newRunState, Pipeline } from "../src/pipeline.js";
+import { decideStart, estimateItem } from "../src/forecast.js";
+import { newIssuesRunState, newItem, newRunState, Pipeline } from "../src/pipeline.js";
 import type { AgentRequest } from "../src/ports.js";
-import { migrateState, type RunState } from "../src/state.js";
+import { buildReport } from "../src/report.js";
+import { type RunState, runItems, setRunItems } from "../src/state.js";
+import { usageLimits } from "../src/usage.js";
+import { describeEvent, renderWatch, summarize } from "../src/watch.js";
 import { GitWorktrees } from "../src/worktrees.js";
 import {
   deferred,
@@ -38,7 +44,7 @@ const allDone = { structured: { status: "all_done", summary: "nothing left" } };
 /** A run that already has two items handed over, TASK-A in `main` and TASK-B in `other`. */
 function twoItems(h: Harness): RunState {
   const state = newRunState("run-1", h.host.now(), "main", "TASK-A");
-  state.items.push(newItem(2, "other", "TASK-B"));
+  setRunItems(state, [...runItems(state), newItem(2, "other", "TASK-B")]);
   state.nextIndex = 3;
   return state;
 }
@@ -106,7 +112,7 @@ describe("parallel lanes", () => {
     const exit = await pipeline.run({ signal });
 
     expect(exit.kind).toBe("done");
-    expect(state.items).toEqual([]);
+    expect(runItems(state)).toEqual([]);
     expect(state.itemsCompleted).toBe(3);
     expect(h.forge.merges.map((m) => m.number).sort()).toEqual([10, 11, 12]);
 
@@ -280,8 +286,9 @@ describe("parallel lanes", () => {
     // TASK-B finished its item; the item it handed over waits for the next invocation.
     expect(h.forge.merges.map((m) => m.number)).toEqual([12]);
     expect(agent.of("TASK-C")).toHaveLength(0);
-    expect(state.items.map((i) => i.handoff)).toEqual(["TASK-A", "TASK-C"]);
-    expect(state.items[0]).toMatchObject({
+    expect(runItems(state).map((i) => i.handoff)).toEqual(["TASK-A", "TASK-C"]);
+    expect(state.version).toBe(2);
+    expect(runItems(state)[0]).toMatchObject({
       pendingQuestion: "Which database?",
       stopped: { kind: "blocked" },
     });
@@ -291,7 +298,8 @@ describe("parallel lanes", () => {
     const second = await start(h, agent, saved).pipeline.run({ signal, answer: "Postgres" });
 
     expect(second.kind).toBe("done");
-    expect(second.state.items).toEqual([]);
+    expect(runItems(second.state)).toEqual([]);
+    expect(second.state.version).toBe(1);
     const resumed = agent.of("TASK-A")[1];
     expect(resumed?.resumeSessionId).toBe("session-TASK-A");
     expect(resumed?.prompt).toContain("Answer: Postgres");
@@ -325,7 +333,7 @@ describe("parallel lanes", () => {
     expect(exit.kind).toBe("paused");
     expect(exit.reason).toContain("STOP");
     // Both running steps finished and were recorded; neither lane went on.
-    expect(state.items.map((i) => i.phase)).toEqual(["checks", "checks"]);
+    expect(runItems(state).map((i) => i.phase)).toEqual(["checks", "checks"]);
     expect(h.forge.merges).toEqual([]);
   });
 
@@ -357,7 +365,7 @@ describe("parallel lanes", () => {
 
     expect(exit.kind).toBe("halted");
     expect(exit.reason).toContain("cannot create a worktree: origin/HEAD is not set");
-    expect(state.items.every((i) => i.stopped?.kind === "halted")).toBe(true);
+    expect(runItems(state).every((i) => i.stopped?.kind === "halted")).toBe(true);
   });
 
   it("starts no more items than --max-items allows", async () => {
@@ -371,17 +379,17 @@ describe("parallel lanes", () => {
     expect(exit.kind).toBe("paused");
     expect(exit.reason).toContain("item limit reached");
     expect(agent.of("TASK-B")).toHaveLength(0);
-    expect(state.items.map((i) => i.handoff)).toEqual(["TASK-B", "TASK-C"]);
+    expect(runItems(state).map((i) => i.handoff)).toEqual(["TASK-B", "TASK-C"]);
   });
 
   it("asks which item an answer is for when several wait for one", async () => {
     const h = await harness(LANES);
     const state = twoItems(h);
-    for (const item of state.items) item.pendingQuestion = `question ${item.index}?`;
+    for (const item of runItems(state)) item.pendingQuestion = `question ${item.index}?`;
     const agent = new LaneAgent({});
     await expect(
       start(h, agent, state).pipeline.run({ signal: AbortSignal.timeout(1000) }),
-    ).rejects.toThrow(/waiting for an answer/);
+    ).rejects.toThrow(/waiting for answers/);
     await expect(
       start(h, agent, state).pipeline.run({ signal: AbortSignal.timeout(1000), answer: "yes" }),
     ).rejects.toThrow(/pick one with --item/);
@@ -411,41 +419,36 @@ describe("parallel lanes", () => {
     await pipeline.run({ signal });
 
     expect(state.usage?.points?.five_hour).toBe(8);
-    const perItem = state.items.map((i) => i.usagePoints?.five_hour ?? 0);
+    const perItem = runItems(state).map((i) => i.usagePoints?.five_hour ?? 0);
     expect(perItem.reduce((a, b) => a + b, 0)).toBeCloseTo(8);
   });
 });
 
-describe("state migration", () => {
-  it("turns a version 1 state file with one item into a list of items", async () => {
+describe("state with several items", () => {
+  it("stays version 1 with one item, and is version 2 while other lanes hold items", async () => {
     const h = await harness();
-    const v1 = {
-      version: 1,
-      runId: "r",
-      startedAt: "2026-11-01T00:00:00.000Z",
-      status: "halted",
-      haltReason: "needs a human: x?",
-      itemsCompleted: 4,
-      costUsd: 12,
-      item: { ...newItem(5, "main", "do T5"), phase: "review", pendingQuestion: "x?" },
-    };
-    await mkdir(h.config.dir, { recursive: true });
-    await writeFile(h.store.statePath, JSON.stringify(v1));
+    const state = newRunState("r", h.host.now(), "main", "do T1");
+    expect(state).not.toHaveProperty("moreItems");
+    const second = newItem(2, "other", "do T2");
+    setRunItems(state, [...runItems(state), second]);
+    expect(state).toMatchObject({ version: 2, moreItems: [second] });
+    await h.store.save(state);
+    const loaded = (await h.store.load()) as RunState;
+    expect(runItems(loaded).map((i) => i.index)).toEqual([1, 2]);
 
-    const state = (await h.store.load()) as RunState;
-
-    expect(state.version).toBe(2);
-    expect(state).not.toHaveProperty("item");
-    expect(state.items).toEqual([v1.item]);
-    expect(state.nextIndex).toBe(6);
-    expect(state).toMatchObject({ runId: "r", itemsCompleted: 4, costUsd: 12 });
+    setRunItems(loaded, [second]);
+    expect(loaded.version).toBe(1);
+    expect(loaded.item).toBe(second);
+    expect(loaded).not.toHaveProperty("moreItems");
+    setRunItems(loaded, []);
+    expect(loaded).not.toHaveProperty("item");
   });
 
-  it("migrates a finished version 1 run to no items, and refuses unknown versions", () => {
-    expect(
-      migrateState({ version: 1, runId: "r", status: "done", itemsCompleted: 1, costUsd: 0 }),
-    ).toMatchObject({ version: 2, items: [], nextIndex: 1 });
-    expect(() => migrateState({ version: 3 })).toThrow(/unsupported state version 3/);
+  it("refuses a state version it does not know", async () => {
+    const h = await harness();
+    await mkdir(h.config.dir, { recursive: true });
+    await writeFile(h.store.statePath, JSON.stringify({ version: 3, runId: "r" }));
+    await expect(h.store.load()).rejects.toThrow(/unsupported state version 3/);
   });
 
   it("keeps a single lane in the repository's checkout", async () => {
@@ -533,5 +536,210 @@ describe("git worktrees", () => {
     await expect(worktrees.create(repo, path.join(root, "wt"), signal)).rejects.toThrow(
       /remote set-head origin --auto/,
     );
+  });
+});
+
+// ── lanes with the other features ─────────────────────────────────────────
+
+describe("parallel lanes with per-step settings, issues, forecasts and answers", () => {
+  it("runs each lane's steps with their [agent.steps] settings", async () => {
+    const h = await harness(
+      `${LANES}\n[agent]\nmodel = "sonnet"\n[agent.steps.finalize]\nmodel = "haiku"\nmax_turns = 9`,
+    );
+    h.forge.addPr(11);
+    h.forge.addPr(12);
+    const agent = new LaneAgent({
+      "TASK-A": [implement(11), allDone],
+      "TASK-B": [implement(12), allDone],
+    });
+    const { pipeline, signal } = start(h, agent, twoItems(h));
+    expect((await pipeline.run({ signal })).kind).toBe("done");
+    for (const key of ["TASK-A", "TASK-B"]) {
+      const [impl, fin] = agent.of(key);
+      expect(impl).toMatchObject({ model: "sonnet", maxTurns: 200 });
+      // finalize-lanes is the finalize step.
+      expect(fin?.prompt).toContain("in progress right now");
+      expect(fin).toMatchObject({ model: "haiku", maxTurns: 9 });
+    }
+  });
+
+  it("gives each free lane its own claimed issue, and finishes when the queue is empty", async () => {
+    const h = await harness(`${LANES}\n[tasks]\nsource = "github_issues"\n`);
+    for (const n of [5, 6, 7]) {
+      h.forge.addIssue(n, { title: `Issue ${n}` });
+      h.forge.addPr(n * 10);
+      h.forge.closesOnMerge.set(n * 10, n);
+    }
+    const together = rendezvous(2);
+    const claimedAtStart = new Map<number, string[]>();
+    const work = (n: number, overlap: boolean) => async (request: AgentRequest) => {
+      claimedAtStart.set(n, (await h.forge.issue("acme/app", n)).labels);
+      expect(request.cwd).toMatch(/item-\d+$/);
+      if (overlap) await together();
+      return implement(n * 10, `#${n}`);
+    };
+    const finalized = { structured: { status: "continue", summary: "post-merge done" } };
+    const agent = new LaneAgent({
+      "issue #5": [work(5, true), finalized],
+      "issue #6": [work(6, true), finalized],
+      "issue #7": [work(7, false), finalized],
+    });
+    const state = newIssuesRunState("run-1", h.host.now(), undefined);
+    const { pipeline, signal, worktrees } = start(h, agent, state);
+
+    const exit = await pipeline.run({ signal });
+
+    expect(exit.kind).toBe("done");
+    expect(exit.reason).toContain("no open issue");
+    expect(state.itemsCompleted).toBe(3);
+    // #5 and #6 ran at the same time, each claimed before its lane started; #7 took a freed lane.
+    for (const n of [5, 6, 7]) {
+      expect(claimedAtStart.get(n)).toContain("nightshift-in-progress");
+      expect((await h.forge.issue("acme/app", n)).state).toBe("CLOSED");
+    }
+    const picked = h.forge.edits.filter((e) =>
+      e.edit.addLabels?.includes("nightshift-in-progress"),
+    );
+    expect(picked.map((e) => e.number)).toEqual([5, 6, 7]);
+    expect(new Set(worktrees.created.map((c) => c.dir)).size).toBe(3);
+    // Issue items finalize without handing over: the queue gives the next one.
+    const fin = agent.of("issue #5")[1];
+    expect(fin?.prompt).toContain("resolves GitHub issue #5");
+    expect(fin?.schema).not.toHaveProperty("properties.next");
+  });
+
+  it("asks a lane's question on GitHub and resumes that lane from the reply", async () => {
+    const h = await harness(`${LANES}\n[answers]\nvia = "github"`);
+    h.forge.addPr(11);
+    h.forge.addPr(12);
+    const agent = new LaneAgent({
+      "TASK-A": [
+        {
+          structured: { status: "blocked", item: "T11", summary: "s", question: "Which DB?" },
+        },
+        implement(11),
+        allDone,
+      ],
+      "TASK-B": [implement(12), allDone],
+    });
+    const { pipeline, state, signal } = start(h, agent, twoItems(h));
+
+    const first = await pipeline.run({ signal });
+
+    expect(first.kind).toBe("blocked");
+    expect(state.stop).toMatchObject({ kind: "blocked", cause: "question" });
+    const post = runItems(state)[0]?.questionPost;
+    expect(post).toMatchObject({ kind: "issue", number: 500 });
+    expect(h.host.notifications[0]?.fields.question_url).toBe(post?.url);
+    expect(decide(state, h.config, h.host.now().getTime(), undefined)).toMatchObject({
+      action: "check_answer",
+      post,
+    });
+
+    h.forge.reply("acme/app", 500, "night-bot", "Postgres.");
+    const second = await start(h, agent, state).pipeline.run({ signal });
+
+    expect(second.kind).toBe("done");
+    expect(agent.of("TASK-A")[1]?.prompt).toContain("Answer: Postgres.");
+    expect(h.forge.issues.get(500)?.state).toBe("CLOSED");
+  });
+
+  it("lets the daemon check every lane's question, and fingerprints every item", async () => {
+    const h = await harness(`${LANES}\n[answers]\nvia = "github"`);
+    const state = twoItems(h);
+    state.status = "halted";
+    state.stop = { kind: "blocked", cause: "question", at: h.host.now().toISOString() };
+    const [a, b] = runItems(state);
+    if (a === undefined || b === undefined) throw new Error("two items expected");
+    a.pendingQuestion = "first?";
+    b.pendingQuestion = "second?";
+    const now = h.host.now().getTime();
+    expect(decide(state, h.config, now, undefined).action).toBe("post_question");
+    const post = (n: number) => ({
+      kind: "issue" as const,
+      repoSlug: "acme/app",
+      number: n,
+      id: n,
+      url: `https://github.com/acme/app/issues/${n}`,
+      postedAt: h.host.now().toISOString(),
+    });
+    a.questionPost = post(500);
+    b.questionPost = post(501);
+    expect(decide(state, h.config, now, undefined)).toMatchObject({
+      action: "check_answer",
+      post: post(500),
+      posts: [post(500), post(501)],
+    });
+    expect(progress(state)).toBe(`run-1|0|1,2|implement,implement|${(0).toFixed(4)}`);
+  });
+
+  it("holds back what the items in progress are still expected to use", () => {
+    const estimate = estimateItem(
+      Array.from({ length: 5 }, () => ({
+        at: "2026-11-01T00:00:00.000Z",
+        points: { five_hour: 10 },
+        activeMs: 60_000,
+        costUsd: 1,
+      })) as Parameters<typeof estimateItem>[0],
+      50,
+    );
+    const ctx = {
+      estimate,
+      limits: usageLimits(parseConfig('[repos]\na = "."\n[usage]\nsession_share = 20', "/h").usage),
+      tally: {},
+      windows: { five_hour: { utilization: 0, resetsAt: "2026-11-04T05:00:00.000Z" } },
+      ranges: [],
+      now: new Date("2026-11-04T00:00:00Z"),
+    };
+    expect(decideStart(ctx).start).toBe(true);
+    // Two items under way that used 2 and 4 of their ~10 points: 14 more are coming.
+    const held = decideStart({ ...ctx, inProgress: [{ five_hour: 2 }, { five_hour: 4 }] });
+    expect(held.start).toBe(false);
+    expect(held.reason).toContain("item(s) in progress are expected to use ~14 more");
+    expect(decideStart({ ...ctx, inProgress: [{ five_hour: 9 }] }).start).toBe(true);
+  });
+
+  it("reports, watches and shows every item in progress", async () => {
+    const h = await harness(LANES);
+    const state = twoItems(h);
+    state.status = "halted";
+    state.haltReason = "[T2] needs a human: Which DB?";
+    state.stop = { kind: "blocked", cause: "question", at: h.host.now().toISOString() };
+    const [a, b] = runItems(state);
+    if (a === undefined || b === undefined) throw new Error("two items expected");
+    a.label = "T1";
+    a.phase = "checks";
+    b.label = "T2";
+    b.pendingQuestion = "Which DB?";
+    b.stopped = { kind: "blocked", reason: "needs a human: Which DB?", cause: "question" };
+
+    const report = buildReport(state, [], h.host.now());
+    expect(report).toContain("### 1. T1 · in progress (checks)");
+    expect(report).toContain("### 2. T2 · blocked");
+    expect(report).toContain("- **Question** (T2): Which DB?");
+
+    const view = {
+      state,
+      holder: undefined,
+      stopRequested: false,
+      events: [],
+      progress: [],
+      limits: usageLimits(h.config.usage),
+    };
+    const screen = renderWatch(view, { now: h.host.now(), width: 120, color: false }).join("\n");
+    expect(screen).toContain("item 1 — T1");
+    expect(screen).toContain("item 2 — T2");
+    expect(screen).toContain("needs an answer: Which DB?");
+    expect(screen).toContain("2 items in progress");
+    expect(summarize(view)).toContain("item 1 — T1 · phase checks · item 2 — T2");
+    expect(
+      describeEvent({
+        at: "2026-11-04T00:00:00.000Z",
+        type: "lane_stop",
+        item: 2,
+        kind: "blocked",
+        reason: "q?",
+      }).text,
+    ).toBe("item 2 · lane blocked: q?");
   });
 });

@@ -341,7 +341,7 @@ describe("resuming", () => {
     const h = await harness();
     h.forge.addPr(11);
     const state = newRunState("run-1", h.host.now(), "main", "do task one");
-    if (state.items[0]) state.items[0].pendingQuestion = "which database?";
+    if (state.item) state.item.pendingQuestion = "which database?";
     state.status = "halted";
     const failing = new FakeAgent([{ outcome: "error", detail: "API overloaded" }]);
     const first = await start(h, failing, state).pipeline.run({
@@ -349,7 +349,7 @@ describe("resuming", () => {
       answer: "postgres",
     });
     expect(first.kind).toBe("halted");
-    expect(state.items[0]?.pendingAnswer).toBe("postgres");
+    expect(state.item?.pendingAnswer).toBe("postgres");
 
     const agent = new FakeAgent([implement(11), ready, allDone]);
     const second = await start(h, agent, state).pipeline.run({
@@ -369,7 +369,7 @@ describe("resuming", () => {
     });
     expect(first.kind).toBe("halted");
     expect(first.reason).toContain("checks failed after 1 fix round");
-    expect(state.items[0]?.capHit).toBe("fix_checks");
+    expect(state.item?.capHit).toBe("fix_checks");
 
     h.forge.prs.get(11)?.checks.push(PASSED);
     const agent = new FakeAgent([ready, allDone]);
@@ -476,14 +476,14 @@ describe("live progress", () => {
     const store = h.store;
     const save = store.save.bind(store);
     store.save = (s) => {
-      if (s.items[0]?.activity?.tools === 2) seenActivity = { ...s.items[0].activity };
+      if (s.item?.activity?.tools === 2) seenActivity = { ...s.item.activity };
       return save(s);
     };
     await pipeline.run({ signal: new AbortController().signal });
     expect(h.host.logs).toContain("[item 1] implement · Bash npm test");
     expect(h.host.logs).toContain("[item 1] implement · Edit src/a.ts");
     expect(seenActivity).toMatchObject({ step: "implement", tools: 2, last: "Edit src/a.ts" });
-    expect(state.items).toEqual([]);
+    expect(state.item).toBeUndefined();
     expect(agent.requests[0]?.artifactPath).toMatch(/implement-\d+\.jsonl$/);
   });
 });
@@ -505,7 +505,7 @@ describe("usage from the stream", () => {
     const exit = await pipeline.run({ signal: new AbortController().signal });
     expect(exit.kind).toBe("paused");
     expect(exit.reason).toContain("nightshift used 12 of its 10-point share");
-    expect(state.items[0]?.usagePoints).toEqual({ five_hour: 12, seven_day: 1 });
+    expect(state.item?.usagePoints).toEqual({ five_hour: 12, seven_day: 1 });
     expect(state.usage?.points).toEqual({ five_hour: 12, seven_day: 1 });
     // The aborted step's reported cost is counted.
     expect(state.costUsd).toBeCloseTo(0.3);

@@ -9,6 +9,10 @@ import type {
   CheckSummary,
   Forge,
   Host,
+  Issue,
+  IssueComment,
+  IssueEdit,
+  PostedComment,
   PullRequest,
   Reviewer,
   ReviewRequest,
@@ -200,11 +204,169 @@ export class FakeForge implements Forge {
     }
     this.merges.push({ number, method, headSha });
     fake.pr = { ...fake.pr, state: "MERGED", mergeCommitSha: `merge-${number}` };
+    const closes = this.closesOnMerge.get(number);
+    const issue = closes === undefined ? undefined : this.issues.get(closes);
+    if (issue !== undefined) issue.state = "CLOSED";
     return Promise.resolve();
   }
 
   deleteBranch(_slug: string, branch: string): Promise<void> {
     this.deletedBranches.push(branch);
+    return Promise.resolve();
+  }
+
+  // ── issues ──
+
+  readonly issues = new Map<number, Issue>();
+  readonly comments: Array<{ number: number; body: string }> = [];
+  readonly closed: Array<{ number: number; comment: string }> = [];
+  readonly edits: Array<{ number: number; edit: IssueEdit }> = [];
+  readonly labelsCreated: string[] = [];
+  user = "night-bot";
+  /** Runs after every edit, e.g. to simulate another process claiming the same issue. */
+  afterEdit: ((issue: Issue) => void) | undefined;
+  /** When set, issue writes (edit, comment, close, label) fail with it. */
+  issueWriteError: Error | undefined;
+  /** Merging a PR closes these issues, like GitHub does for `Closes #N`. */
+  readonly closesOnMerge = new Map<number, number>();
+
+  addIssue(number: number, overrides: Partial<Issue> = {}): Issue {
+    const issue: Issue = {
+      number,
+      title: `Issue ${number}`,
+      body: `Body of issue ${number}`,
+      url: `https://github.com/acme/app/issues/${number}`,
+      state: "OPEN",
+      labels: ["nightshift"],
+      assignees: [],
+      author: "alice",
+      createdAt: new Date(Date.UTC(2026, 0, number)).toISOString(),
+      ...overrides,
+    };
+    this.issues.set(number, issue);
+    return issue;
+  }
+
+  currentUser(): Promise<string> {
+    return Promise.resolve(this.user);
+  }
+
+  listIssues(_slug: string, label: string): Promise<Issue[]> {
+    return Promise.resolve(
+      [...this.issues.values()]
+        .filter((i) => i.state === "OPEN" && i.labels.includes(label))
+        .map((i) => ({ ...i, body: "" })),
+    );
+  }
+
+  issue(_slug: string, number: number): Promise<Issue> {
+    const issue = this.issues.get(number);
+    if (issue === undefined) return Promise.reject(new Error(`no issue #${number}`));
+    return Promise.resolve({
+      ...issue,
+      labels: [...issue.labels],
+      assignees: [...issue.assignees],
+    });
+  }
+
+  editIssue(_slug: string, number: number, edit: IssueEdit): Promise<void> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    const issue = this.issues.get(number);
+    if (issue === undefined) return Promise.reject(new Error(`no issue #${number}`));
+    this.edits.push({ number, edit });
+    const without = (list: string[], remove: string[] = []) =>
+      list.filter((x) => !remove.includes(x));
+    const union = (list: string[], add: string[] = []) => [
+      ...list,
+      ...add.filter((x) => !list.includes(x)),
+    ];
+    issue.labels = union(without(issue.labels, edit.removeLabels), edit.addLabels);
+    issue.assignees = union(without(issue.assignees, edit.removeAssignees), edit.addAssignees);
+    this.afterEdit?.(issue);
+    return Promise.resolve();
+  }
+
+  commentIssue(slug: string, number: number, body: string): Promise<PostedComment> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    this.comments.push({ number, body });
+    const c = this.reply(slug, number, this.user, body);
+    return Promise.resolve({ id: c.id, url: c.url, createdAt: c.createdAt });
+  }
+
+  closeIssue(_slug: string, number: number, comment: string): Promise<void> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    const issue = this.issues.get(number);
+    if (issue === undefined) return Promise.reject(new Error(`no issue #${number}`));
+    issue.state = "CLOSED";
+    this.closed.push({ number, comment });
+    return Promise.resolve();
+  }
+
+  // ── conversation (answers on GitHub) ──
+  /** Where comment and issue timestamps come from; the harness points it at the fake clock. */
+  clock: () => Date = () => new Date();
+  /** Comments per `slug#number`, oldest first (commentIssue adds them too). */
+  readonly threads = new Map<string, IssueComment[]>();
+  /** Numbers of the issues createIssue opened. */
+  readonly created: number[] = [];
+  readonly reactions: Array<{ slug: string; commentId: number; content: string }> = [];
+  private nextId = 1000;
+
+  /** Adds a comment as someone else, e.g. the human answering. */
+  reply(
+    slug: string,
+    number: number,
+    author: string,
+    body: string,
+    options: { bot?: boolean; at?: Date } = {},
+  ): IssueComment {
+    const id = this.nextId++;
+    const comment: IssueComment = {
+      id,
+      author,
+      authorIsBot: options.bot ?? false,
+      body,
+      createdAt: (options.at ?? this.clock()).toISOString(),
+      url: `https://github.com/${slug}/issues/${number}#issuecomment-${id}`,
+    };
+    const key = `${slug}#${number}`;
+    this.threads.set(key, [...(this.threads.get(key) ?? []), comment]);
+    return comment;
+  }
+
+  createIssue(
+    slug: string,
+    title: string,
+    body: string,
+  ): Promise<PostedComment & { number: number }> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    const number = 500 + this.created.length;
+    this.created.push(number);
+    const createdAt = this.clock().toISOString();
+    const issue = this.addIssue(number, {
+      title,
+      body,
+      url: `https://github.com/${slug}/issues/${number}`,
+      labels: [],
+      author: this.user,
+      createdAt,
+    });
+    return Promise.resolve({ number, id: this.nextId++, url: issue.url, createdAt });
+  }
+
+  listComments(slug: string, number: number, since: string): Promise<IssueComment[]> {
+    const all = this.threads.get(`${slug}#${number}`) ?? [];
+    return Promise.resolve(all.filter((c) => Date.parse(c.createdAt) >= Date.parse(since)));
+  }
+
+  addReaction(slug: string, commentId: number, content: "+1" | "eyes"): Promise<void> {
+    this.reactions.push({ slug, commentId, content });
+    return Promise.resolve();
+  }
+
+  ensureLabel(_slug: string, name: string): Promise<void> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    if (!this.labelsCreated.includes(name)) this.labelsCreated.push(name);
     return Promise.resolve();
   }
 }
@@ -291,13 +453,16 @@ export interface Harness {
 export async function harness(extraConfig = ""): Promise<Harness> {
   const home = await tempHome();
   const config = testConfig(home, extraConfig);
+  const host = new FakeHost();
+  const forge = new FakeForge();
+  forge.clock = () => host.now();
   return {
     config,
     templates: await loadTemplates(undefined),
     store: new StateStore(config.dir),
-    forge: new FakeForge(),
+    forge,
     reviewer: new FakeReviewer(),
-    host: new FakeHost(),
+    host,
   };
 }
 

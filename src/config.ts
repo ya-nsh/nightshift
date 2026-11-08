@@ -13,13 +13,70 @@ const repoAlias = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/, "repo aliases use letters, digits, '.', '_' or '-'");
 
+/** A GitHub user name (bots are never trusted to answer, so `[bot]` accounts are rejected). */
+const githubLogin = z
+  .string()
+  .regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, "not a GitHub user name (letters, digits, '-')");
+
 /** A percentage of a usage window, 0–100 (0 = no limit). */
 const percent = z.number().min(0).max(100);
+
+/** A GitHub label name; `gh` splits flag values on commas, so those are not allowed. */
+const labelName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(50)
+  .refine((name) => !name.includes(","), "label names cannot contain commas");
+/** A label nightshift manages, or "" for none. */
+const optionalLabel = z.union([z.literal(""), labelName]);
+
+export const TASK_SOURCES = ["handoff", "github_issues"] as const;
+export type TaskSource = (typeof TASK_SOURCES)[number];
 
 export const PERMISSION_MODES = ["auto", "acceptEdits", "dontAsk", "bypassPermissions"] as const;
 export const MERGE_METHODS = ["merge", "rebase", "squash"] as const;
 /** Upper bound for `[limits] lanes`: each lane is a Claude session, a worktree and a PR at once. */
 export const MAX_LANES = 8;
+export type PermissionMode = (typeof PERMISSION_MODES)[number];
+
+/** The Claude steps of an item whose agent settings `[agent.steps.<step>]` can override. */
+export const AGENT_STEPS = [
+  "implement",
+  "address",
+  "fix_checks",
+  "resolve_conflicts",
+  "finalize",
+] as const;
+export type AgentStep = (typeof AGENT_STEPS)[number];
+
+/** One `[agent.steps.<step>]` table: unset keys fall back to `[agent]`. */
+const stepOverride = z.strictObject({
+  model: z.string().trim().min(1, "model must not be empty").optional(),
+  max_turns: z.number().int().positive().optional(),
+  permission_mode: z.enum(PERMISSION_MODES).optional(),
+});
+
+/** `[agent.steps.plan]` (`nightshift plan`): no permission_mode, the plan session is always read-only. */
+const planOverride = stepOverride.omit({ permission_mode: true });
+
+const agentSteps = z
+  .strictObject(
+    {
+      ...(Object.fromEntries(AGENT_STEPS.map((step) => [step, stepOverride.optional()])) as Record<
+        AgentStep,
+        z.ZodOptional<typeof stepOverride>
+      >),
+      plan: planOverride.optional(),
+    },
+    {
+      error: (issue) =>
+        issue.code === "unrecognized_keys"
+          ? `unknown step${issue.keys.length === 1 ? "" : "s"} ${issue.keys.map((k) => `"${k}"`).join(", ")}; steps are ${AGENT_STEPS.join(", ")}, plan`
+          : undefined,
+    },
+  )
+  .default({});
 
 const configSchema = z.strictObject({
   default_repo: repoAlias.optional(),
@@ -36,12 +93,15 @@ const configSchema = z.strictObject({
       add_dirs: z.array(z.string().min(1)).default([]),
       max_turns: z.number().int().positive().default(200),
       extra_args: z.array(z.string()).default([]),
+      steps: agentSteps,
     })
     .prefault({}),
   budget: z
     .strictObject({
       item_usd: z.number().positive().default(25),
       invocation_usd: z.number().positive().default(150),
+      /** Ceiling for one `nightshift plan` session. */
+      plan_usd: z.number().positive().default(2),
     })
     .prefault({}),
   review: z
@@ -86,6 +146,9 @@ const configSchema = z.strictObject({
       weekly_max: percent.default(0),
       on_limit: z.enum(["wait", "halt"]).default("wait"),
       check_seconds: z.number().int().min(10).max(3600).default(60),
+      /** Unset: on when usage limits or active hours are set. */
+      start_item_only_if_it_fits: z.boolean().optional(),
+      forecast_percentile: z.number().int().min(50).max(100).default(50),
     })
     .prefault({}),
   schedule: z
@@ -105,14 +168,34 @@ const configSchema = z.strictObject({
       outside_hours: z.enum(["wait", "halt"]).default("wait"),
     })
     .prefault({}),
+  tasks: z
+    .strictObject({
+      source: z.enum(TASK_SOURCES).default("handoff"),
+      label: labelName.default("nightshift"),
+      repo: repoAlias.optional(),
+      priority_labels: z.array(labelName).default([]),
+      skip_labels: z.array(labelName).default(["blocked"]),
+      authors: z.array(z.string().trim().min(1)).default([]),
+      assign: z.boolean().default(true),
+      in_progress_label: optionalLabel.default("nightshift-in-progress"),
+      blocked_label: optionalLabel.default("nightshift-blocked"),
+    })
+    .prefault({}),
   notify: z.strictObject({ command: z.string().default("") }).prefault({}),
+  answers: z
+    .strictObject({
+      via: z.enum(["terminal", "github"]).default("terminal"),
+      users: z.array(githubLogin).default([]),
+      poll_seconds: z.number().int().min(30).max(3600).default(120),
+    })
+    .prefault({}),
   prompts: z.strictObject({ dir: z.string().min(1).optional() }).prefault({}),
 });
 
 export type RawConfig = z.infer<typeof configSchema>;
 
 /** Validated config with every path made absolute. */
-export interface Config extends Omit<RawConfig, "repos" | "default_repo"> {
+export interface Config extends Omit<RawConfig, "repos" | "default_repo" | "tasks"> {
   /** Directory containing `.nightshift/`; relative paths in the config resolve against it. */
   home: string;
   /** `<home>/.nightshift` */
@@ -120,6 +203,8 @@ export interface Config extends Omit<RawConfig, "repos" | "default_repo"> {
   repos: Record<string, string>;
   defaultRepo: string;
   promptsDir: string | undefined;
+  /** `[tasks]`, with `repo` resolved to an alias (default: `defaultRepo`). */
+  tasks: Omit<RawConfig["tasks"], "repo"> & { repo: string };
 }
 
 export class ConfigError extends Error {
@@ -148,6 +233,13 @@ export function parseConfig(text: string, home: string): Config {
       `default_repo "${raw.default_repo}" is not one of: ${aliases.join(", ")}`,
     );
   }
+  const tasks = { ...raw.tasks, repo: raw.tasks.repo ?? defaultRepo };
+  const taskIssues = validateTasks(tasks, aliases);
+  if (taskIssues.length > 0) {
+    throw new ConfigError(
+      `invalid config:\n${taskIssues.map((i) => `  - tasks: ${i}`).join("\n")}`,
+    );
+  }
   const resolve = (p: string) => path.resolve(home, expandHome(p));
   const { repos: _repos, default_repo: _default, ...rest } = raw;
   return {
@@ -165,7 +257,78 @@ export function parseConfig(text: string, home: string): Config {
     repos: Object.fromEntries(Object.entries(raw.repos).map(([alias, p]) => [alias, resolve(p)])),
     defaultRepo,
     promptsDir: raw.prompts.dir === undefined ? undefined : resolve(raw.prompts.dir),
+    tasks,
   };
+}
+
+function validateTasks(tasks: Config["tasks"], aliases: string[]): string[] {
+  const issues: string[] = [];
+  if (!aliases.includes(tasks.repo)) {
+    issues.push(`repo "${tasks.repo}" is not one of: ${aliases.join(", ")}`);
+  }
+  const managed = {
+    in_progress_label: tasks.in_progress_label,
+    blocked_label: tasks.blocked_label,
+  };
+  for (const [key, name] of Object.entries(managed)) {
+    if (name === "") continue;
+    if (name === tasks.label) issues.push(`${key} must differ from label ("${name}")`);
+  }
+  if (tasks.in_progress_label !== "" && tasks.in_progress_label === tasks.blocked_label) {
+    issues.push("in_progress_label and blocked_label must differ");
+  }
+  if (tasks.skip_labels.includes(tasks.label)) {
+    issues.push(`label "${tasks.label}" is also in skip_labels, so no issue could be picked`);
+  }
+  if (tasks.source === "github_issues" && !tasks.assign && tasks.in_progress_label === "") {
+    issues.push("an issue must be claimed somehow: set assign = true or an in_progress_label");
+  }
+  return issues;
+}
+
+/** The agent settings one Claude step runs with. */
+export interface StepSettings {
+  /** undefined: Claude Code's default model. */
+  model: string | undefined;
+  maxTurns: number;
+  permissionMode: PermissionMode;
+}
+
+/**
+ * The effective settings for `step`: its `[agent.steps.<step>]` overrides on top of `[agent]`.
+ * Without a step (a Claude call that is not one of an item's steps) `[agent]` applies as is.
+ */
+export function stepSettings(agent: Config["agent"], step: AgentStep | undefined): StepSettings {
+  const override = step === undefined ? undefined : agent.steps[step];
+  return {
+    model: override?.model ?? agent.model,
+    maxTurns: override?.max_turns ?? agent.max_turns,
+    permissionMode: override?.permission_mode ?? agent.permission_mode,
+  };
+}
+
+/**
+ * The model and max_turns of `nightshift plan`: `[agent.steps.plan]` on top of `[agent]`. Its
+ * permission mode is not configurable; the session is always read-only.
+ */
+export function planSettings(agent: Config["agent"]): Omit<StepSettings, "permissionMode"> {
+  const override = agent.steps.plan;
+  return {
+    model: override?.model ?? agent.model,
+    maxTurns: override?.max_turns ?? agent.max_turns,
+  };
+}
+
+/** Every step's model, plus any max_turns/permission_mode override, for `nightshift doctor`. */
+export function describeStepSettings(agent: Config["agent"]): string {
+  return AGENT_STEPS.map((step) => {
+    const settings = stepSettings(agent, step);
+    const extras = [
+      settings.maxTurns === agent.max_turns ? "" : `max_turns ${settings.maxTurns}`,
+      settings.permissionMode === agent.permission_mode ? "" : settings.permissionMode,
+    ].filter((extra) => extra !== "");
+    return `${step} ${settings.model ?? "default"}${extras.length > 0 ? ` (${extras.join(", ")})` : ""}`;
+  }).join(" · ");
 }
 
 export function expandHome(p: string): string {

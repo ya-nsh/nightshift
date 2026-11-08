@@ -3,6 +3,8 @@
  * in-memory fakes and the real adapters stay thin.
  */
 
+import type { PermissionMode } from "./config.js";
+
 export interface AgentRequest {
   /** Working directory for the session (the repo the item runs in). */
   cwd: string;
@@ -19,6 +21,21 @@ export interface AgentRequest {
   signal: AbortSignal;
   /** Progress while the step runs: tool calls, and plan usage when Claude reports it. */
   onEvent?: (event: AgentEvent) => void;
+  /**
+   * This step's effective settings (`[agent.steps.<step>]` over `[agent]`). Each one left out falls
+   * back to the backend's `[agent]` config; `model` left out there too means Claude Code's default.
+   */
+  model?: string;
+  maxTurns?: number;
+  /** Ignored when `readOnly` is set. */
+  permissionMode?: PermissionMode;
+  /**
+   * Run the session read-only (`nightshift plan`): only the Read, Glob and Grep tools exist, nothing
+   * else may be approved, MCP servers and the config's own tool and permission settings are left out.
+   */
+  readOnly?: boolean;
+  /** More directories the session may use, besides `cwd` and `agent.add_dirs`. */
+  addDirs?: string[];
 }
 
 export type AgentEvent =
@@ -91,6 +108,70 @@ export interface Forge {
     options?: { auto?: boolean },
   ): Promise<void>;
   deleteBranch(repoSlug: string, branch: string): Promise<void>;
+
+  // ── issues (the `github_issues` task source) ──
+  /** Login of the account the forge acts as. */
+  currentUser(): Promise<string>;
+  /** Open issues carrying `label`; `body` may be empty here, `issue()` has it. */
+  listIssues(repoSlug: string, label: string): Promise<Issue[]>;
+  issue(repoSlug: string, number: number): Promise<Issue>;
+  editIssue(repoSlug: string, number: number, edit: IssueEdit): Promise<void>;
+  /** Comments on an issue or a PR (`number`), in its conversation tab. */
+  commentIssue(repoSlug: string, number: number, body: string): Promise<PostedComment>;
+  /** Closes the issue as completed, with a comment. */
+  closeIssue(repoSlug: string, number: number, comment: string): Promise<void>;
+  /** Creates the label if the repository does not have it yet. */
+  ensureLabel(repoSlug: string, name: string, color: string, description: string): Promise<void>;
+
+  // ── conversation (asking a human on GitHub, `[answers] via = "github"`) ──
+  createIssue(
+    repoSlug: string,
+    title: string,
+    body: string,
+  ): Promise<PostedComment & { number: number }>;
+  /** Comments on an issue or PR created at or after `since` (ISO), oldest first. */
+  listComments(repoSlug: string, number: number, since: string): Promise<IssueComment[]>;
+  addReaction(repoSlug: string, commentId: number, content: "+1" | "eyes"): Promise<void>;
+}
+
+export type IssueState = "OPEN" | "CLOSED";
+
+export interface Issue {
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+  state: IssueState;
+  labels: string[];
+  assignees: string[];
+  author: string;
+  createdAt: string;
+}
+
+export interface IssueEdit {
+  addLabels?: string[];
+  removeLabels?: string[];
+  addAssignees?: string[];
+  removeAssignees?: string[];
+}
+
+/** A comment nightshift posted, or an issue it opened (`id` is the issue's own id). */
+export interface PostedComment {
+  id: number;
+  url: string;
+  /** GitHub's timestamp (ISO), so replies are compared on GitHub's clock. */
+  createdAt: string;
+}
+
+/** A comment in a PR's or issue's conversation. */
+export interface IssueComment {
+  id: number;
+  author: string;
+  /** A GitHub App or other bot account. */
+  authorIsBot: boolean;
+  body: string;
+  createdAt: string;
+  url: string;
 }
 
 export interface ReviewRequest {

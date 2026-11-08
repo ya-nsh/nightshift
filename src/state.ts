@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { UsageWindows } from "./ports.js";
 import type { UsageTally, UsageWindow } from "./usage.js";
@@ -55,6 +55,10 @@ export interface ItemState {
   pendingQuestion?: string;
   pendingAnswer?: string;
   costUsd: number;
+  /** When the item's first implement step started (after the forecast let it start). */
+  startedAt?: string;
+  /** Time spent on the item so far, without usage/schedule waits and pauses (for forecasts). */
+  activeMs?: number;
   /** Percentage points of each usage window this item's steps used (when usage is measured). */
   usagePoints?: Partial<Record<UsageWindow, number>>;
   /** The Claude step running right now, for `status`. */
@@ -63,34 +67,124 @@ export interface ItemState {
   autoMergeSha?: string;
   /** The bounded loop whose cap halted the run; `resume` grants that loop fresh rounds. */
   capHit?: "fix_checks" | "resolve_conflicts";
+  /** Where `pendingQuestion` was asked on GitHub (`[answers] via = "github"`). */
+  questionPost?: QuestionPost;
+  /** The GitHub issue this item works on (`[tasks] source = "github_issues"`). */
+  issue?: ItemIssue;
   /** With parallel lanes: the git worktree nightshift created for this item. */
   worktree?: { path: string; base: string };
   /** With parallel lanes: why this item's lane stopped while others went on; cleared by `resume`. */
-  stopped?: { kind: "halted" | "blocked" | "paused"; reason: string };
+  stopped?: { kind: "halted" | "blocked" | "paused"; reason: string; cause: StopCause };
 }
 
-export const STATE_VERSION = 2;
+export interface QuestionPost {
+  /**
+   * A comment on the item's PR, a comment on the GitHub issue the item works on, or an issue
+   * opened for the question because there was neither.
+   */
+  kind: "pr_comment" | "issue_comment" | "issue";
+  repoSlug: string;
+  /** The PR or issue number the conversation is on. */
+  number: number;
+  /** Id of the question comment (or of the issue). */
+  id: number;
+  url: string;
+  /** GitHub's creation time; only replies created at or after it count. */
+  postedAt: string;
+}
+
+/** Why a run stopped. The daemon decides on `cause`, never on the human-readable reason. */
+export type StopCause =
+  /** Nothing left to do. */
+  | "done"
+  /** Claude asked a question (`pendingQuestion`). */
+  | "question"
+  /** `nightshift stop`. */
+  | "stop_requested"
+  /** `--once`, `--max-items`, `[limits] max_items`. */
+  | "item_limit"
+  /** A `[usage]` limit with on_limit = "halt"; clears at `resumeAt`. */
+  | "usage_limit"
+  /** Outside `[schedule] active_hours` with outside_hours = "halt"; clears at `resumeAt`. */
+  | "outside_hours"
+  /** The forecast said a typical item would not fit the usage limits (on_limit = "halt"). */
+  | "forecast_usage"
+  /** The forecast said a typical item would not fit the active hours (outside_hours = "halt"). */
+  | "forecast_hours"
+  /** Ctrl-C (SIGINT). */
+  | "interrupted"
+  /** SIGTERM: a shutdown, logout or service stop; nobody chose to stop the run. */
+  | "terminated"
+  /** Something went wrong that a human must look at. */
+  | "failure";
+
+export interface StopInfo {
+  kind: "done" | "paused" | "blocked" | "halted";
+  cause: StopCause;
+  at: string;
+  /** When the cause clears by itself (usage window reset, start of active hours, forecasts). */
+  resumeAt?: string;
+}
+
+export interface ItemIssue {
+  number: number;
+  title: string;
+  url: string;
+  repoSlug: string;
+  /** Set once the claim (in-progress label and/or assignee) is in place. */
+  claimed?: boolean;
+  /** The in-progress label the claim uses; removed again when the claim is released. */
+  claimLabel?: string;
+  /** The assignee the claim added (not one a human had set); removed when the claim is released. */
+  assignee?: string;
+  /** The blocked label nightshift added when the item stopped; removed on `resume`. */
+  flagged?: string;
+  /** The stop reason last posted on the issue, so the same stop is not commented twice. */
+  noted?: string;
+  /** Finalize's post-merge work is done; what is left is making sure the issue is closed. */
+  finalized?: boolean;
+}
+
+/** Run-wide state of the `github_issues` task source. */
+export interface IssuesRunState {
+  /** `--prompt` given to `run`: extra instructions added to every issue's prompt. */
+  instructions?: string;
+  /** Index of the last item created from an issue. */
+  picked?: number;
+  /** Issues this run let go of without a PR (Claude found nothing to change); not picked again. */
+  skipped?: number[];
+}
+
+/**
+ * State files are version 1 while a run has at most one item in progress, which is always the case
+ * with `[limits] lanes = 1`; a run holding more items (`moreItems`) is version 2, so a nightshift that
+ * knows only one item refuses it instead of losing the others.
+ */
+export const STATE_VERSIONS = [1, 2] as const;
 
 export interface RunState {
-  version: 2;
+  version: (typeof STATE_VERSIONS)[number];
   runId: string;
   startedAt: string;
   status: "running" | "halted" | "done";
   haltReason?: string;
   itemsCompleted: number;
   costUsd: number;
-  /**
-   * The items in progress, in the order they were handed over: at most one with `[limits] lanes = 1`.
-   * Items leave the list when they are done.
-   */
-  items: ItemState[];
-  /** Index the next handed-over item gets (indexes are never reused within a run). */
-  nextIndex: number;
+  /** The item in progress; with parallel lanes, the first of them (see `runItems`). */
+  item?: ItemState;
+  /** With parallel lanes: the items in progress besides `item`, in the order they were handed over. */
+  moreItems?: ItemState[];
+  /** With parallel lanes: the index the next item gets (indexes are never reused within a run). */
+  nextIndex?: number;
   /** `--usage-share` given to `run` or `resume`; overrides `[usage] session_share` for this run. */
   usageShare?: number;
   usage?: UsageState;
   /** Set while the run sleeps: for a usage window to reset, or for its active hours. */
   waiting?: { until: string; reason: string };
+  /** Why the run last stopped; unset while it runs. */
+  stop?: StopInfo;
+  /** Present when the run takes its tasks from GitHub issues. */
+  issues?: IssuesRunState;
 }
 
 export interface UsageState {
@@ -102,34 +196,39 @@ export interface UsageState {
   last?: { at: string; windows: UsageWindows };
 }
 
-/**
- * Brings a state file written by an older nightshift up to date: version 1 held a single `item`,
- * version 2 holds the list of `items` that parallel lanes work on.
- */
-export function migrateState(raw: Record<string, unknown>): RunState {
-  if (raw.version === 1) {
-    const { item, ...rest } = raw as { item?: ItemState } & Record<string, unknown>;
-    const items = item === undefined ? [] : [item];
-    return {
-      ...(rest as Omit<RunState, "version" | "items" | "nextIndex">),
-      version: 2,
-      items,
-      nextIndex: nextIndexAfter(items),
-    };
-  }
-  if (raw.version !== STATE_VERSION) {
-    throw new Error(
-      `unsupported state version ${String(raw.version)} (this nightshift reads versions 1 and ${STATE_VERSION}; upgrade nightshift)`,
-    );
-  }
-  const state = raw as unknown as RunState;
-  if (!Array.isArray(state.items)) throw new Error("invalid state: items is not a list");
-  if (typeof state.nextIndex !== "number") state.nextIndex = nextIndexAfter(state.items);
-  return state;
+/** One tool call of a Claude step, as appended to a run's progress feed for `nightshift watch`. */
+export interface ProgressEntry {
+  at: string;
+  item: number;
+  step: string;
+  tool: string;
+  detail: string;
 }
 
-function nextIndexAfter(items: readonly ItemState[]): number {
-  return items.reduce((max, item) => Math.max(max, item.index), 0) + 1;
+export const PROGRESS_FILE = "progress.jsonl";
+/** The previous progress feed, kept after a rotation. */
+export const PROGRESS_ROTATED_FILE = "progress.1.jsonl";
+/** The progress feed rotates when it grows past this, so it stays bounded at about twice this. */
+export const PROGRESS_MAX_BYTES = 256 * 1024;
+
+/** Every item in progress, in hand-over order: `item` first, then the other lanes' items. */
+export function runItems(state: Pick<RunState, "item" | "moreItems">): ItemState[] {
+  const more = state.moreItems ?? [];
+  return state.item === undefined ? [...more] : [state.item, ...more];
+}
+
+/** Replaces the items in progress (see `runItems`), keeping the file version 1 while it can be. */
+export function setRunItems(state: RunState, items: readonly ItemState[]): void {
+  const [first, ...more] = items;
+  if (first === undefined) delete state.item;
+  else state.item = first;
+  if (more.length > 0) {
+    state.moreItems = more;
+    state.version = 2;
+  } else {
+    delete state.moreItems;
+    state.version = 1;
+  }
 }
 
 export function newRunId(now: Date): string {
@@ -141,6 +240,8 @@ export function newRunId(now: Date): string {
 export class StateStore {
   /** Saves run one after another: a usage check and progress updates may save during a step. */
   private saving: Promise<void> = Promise.resolve();
+  /** Appends to the progress feed one after another, so a rotation never races an append. */
+  private feeding: Promise<void> = Promise.resolve();
 
   constructor(readonly dir: string) {}
 
@@ -160,7 +261,16 @@ export class StateStore {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
-    return migrateState(JSON.parse(text) as Record<string, unknown>);
+    const state = JSON.parse(text) as RunState;
+    if (!(STATE_VERSIONS as readonly number[]).includes(state.version)) {
+      throw new Error(
+        `unsupported state version ${String(state.version)} (this nightshift reads versions ${STATE_VERSIONS.join(" and ")}; upgrade nightshift)`,
+      );
+    }
+    if (state.moreItems !== undefined && !Array.isArray(state.moreItems)) {
+      throw new Error("invalid state: moreItems is not a list");
+    }
+    return state;
   }
 
   save(state: RunState): Promise<void> {
@@ -189,6 +299,25 @@ export class StateStore {
     const line = JSON.stringify({ at: new Date().toISOString(), ...event });
     await appendFile(path.join(dir, "events.jsonl"), `${line}\n`);
   }
+
+  /**
+   * Appends a tool call to the run's progress feed. The feed is bounded: past `maxBytes` the file
+   * becomes `progress.1.jsonl` (replacing the one before) and a new one starts.
+   */
+  progress(runId: string, entry: ProgressEntry, maxBytes = PROGRESS_MAX_BYTES): Promise<void> {
+    const line = `${JSON.stringify(entry)}\n`;
+    const dir = this.runDir(runId);
+    const next = this.feeding.then(async () => {
+      await mkdir(dir, { recursive: true });
+      const file = path.join(dir, PROGRESS_FILE);
+      await appendFile(file, line);
+      if ((await stat(file)).size > maxBytes) {
+        await rename(file, path.join(dir, PROGRESS_ROTATED_FILE));
+      }
+    });
+    this.feeding = next.catch(() => {});
+    return next;
+  }
 }
 
 export class LockedError extends Error {
@@ -196,10 +325,10 @@ export class LockedError extends Error {
 }
 
 /** The pid holding the lock in `dir`, if that process is alive. */
-export function lockHolder(dir: string): number | undefined {
+export function lockHolder(dir: string, name = "lock"): number | undefined {
   let text: string;
   try {
-    text = readFileSync(path.join(dir, "lock"), "utf8");
+    text = readFileSync(path.join(dir, name), "utf8");
   } catch {
     return undefined;
   }
@@ -211,9 +340,10 @@ export function lockHolder(dir: string): number | undefined {
 export class Lock {
   private constructor(private readonly file: string) {}
 
-  static async acquire(dir: string): Promise<Lock> {
+  /** `name` is the lock file in `dir`; the daemon has its own, so it never blocks a run. */
+  static async acquire(dir: string, name = "lock"): Promise<Lock> {
     await mkdir(dir, { recursive: true });
-    const file = path.join(dir, "lock");
+    const file = path.join(dir, name);
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const handle = await open(file, "wx");

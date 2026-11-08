@@ -1,18 +1,34 @@
 import path from "node:path";
 import type { z } from "zod";
-import type { Config } from "./config.js";
+import { acknowledge, allowedUsers, findAnswer, postQuestion } from "./answers.js";
+import { type AgentStep, type Config, type StepSettings, stepSettings } from "./config.js";
+import { decideStart, estimateItem, readHistory } from "./forecast.js";
+import {
+  BLOCKED_COLOR,
+  BLOCKED_DESCRIPTION,
+  hasLabel,
+  IN_PROGRESS_COLOR,
+  IN_PROGRESS_DESCRIPTION,
+  ineligible,
+  quote,
+  rankIssues,
+  releaseClaim,
+} from "./issues.js";
 import type {
   Agent,
   AgentResult,
   Forge,
   Host,
+  Issue,
   Reviewer,
   UsageMeter,
   UsageWindows,
   Worktrees,
 } from "./ports.js";
+import { writeReport } from "./report.js";
 import { isActive, nextStart } from "./schedule.js";
 import {
+  finalizeIssueResult,
   finalizeLanesResult,
   finalizeResult,
   type ImplementResult,
@@ -23,11 +39,14 @@ import {
 } from "./schemas.js";
 import {
   AGENT_PHASES,
+  type ItemIssue,
   type ItemState,
   type Phase,
   type RunState,
-  STATE_VERSION,
+  runItems,
   type StateStore,
+  type StopCause,
+  setRunItems,
 } from "./state.js";
 import { render, type TemplateName, type Templates } from "./templates.js";
 import {
@@ -38,6 +57,7 @@ import {
   limitHit,
   limitsEnabled,
   missingWindows,
+  sameWindow,
   USAGE_WINDOWS,
   type UsageLimits,
   type UsageWindow,
@@ -57,6 +77,15 @@ const USAGE_READ_ATTEMPTS = 3;
 const USAGE_RETRY_MS = 5_000;
 /** While a step runs, progress is written to state.json at most this often. */
 const PROGRESS_SAVE_MS = 10_000;
+/** The `[agent.steps.<step>]` table each step template runs with. */
+const STEP_OF_TEMPLATE: Partial<Record<TemplateName, AgentStep>> = {
+  implement: "implement",
+  address: "address",
+  "fix-checks": "fix_checks",
+  "resolve-conflicts": "resolve_conflicts",
+  finalize: "finalize",
+  "finalize-lanes": "finalize",
+};
 
 export interface PipelineDeps {
   config: Config;
@@ -77,7 +106,7 @@ export interface InvocationOptions {
   maxItems?: number;
   /** Answer to the question the run halted on. */
   answer?: string;
-  /** With several items waiting for an answer: the index of the item `answer` is for. */
+  /** With parallel lanes and several open questions: the index of the item `answer` is for. */
   answerItem?: number;
   signal: AbortSignal;
 }
@@ -122,6 +151,13 @@ interface UsageShare {
   cut: LimitHit | undefined;
 }
 
+/** With parallel lanes: a stop that applies to every lane. */
+interface RunStop {
+  exit: Exit & { kind: Exclude<ExitKind, "done"> };
+  cause: StopCause;
+  resumeAt: Date | undefined;
+}
+
 /** How bad an exit is: the exit of a run with several lanes is its worst lane's. */
 const SEVERITY: Record<ExitKind, number> = { done: 0, paused: 1, blocked: 2, halted: 3 };
 
@@ -154,14 +190,33 @@ export function newItem(index: number, repo: string, handoff: string): ItemState
 
 export function newRunState(runId: string, now: Date, repo: string, prompt: string): RunState {
   return {
-    version: STATE_VERSION,
+    version: 1,
     runId,
     startedAt: now.toISOString(),
     status: "running",
     itemsCompleted: 0,
     costUsd: 0,
-    items: [newItem(1, repo, prompt)],
-    nextIndex: 2,
+    item: newItem(1, repo, prompt),
+  };
+}
+
+/**
+ * A run whose tasks come from GitHub issues (`[tasks] source = "github_issues"`): it starts without
+ * an item and picks the first issue itself. `instructions` (from `--prompt`) go with every issue.
+ */
+export function newIssuesRunState(
+  runId: string,
+  now: Date,
+  instructions: string | undefined,
+): RunState {
+  return {
+    version: 1,
+    runId,
+    startedAt: now.toISOString(),
+    status: "running",
+    itemsCompleted: 0,
+    costUsd: 0,
+    issues: instructions === undefined || instructions.trim() === "" ? {} : { instructions },
   };
 }
 
@@ -172,20 +227,28 @@ export function newRunState(runId: string, now: Date, repo: string, prompt: stri
  *
  * With `[limits] lanes = 1` one item runs at a time in the repository's own checkout. With more
  * lanes, up to that many items run at once, each in a git worktree nightshift creates; merges are
- * serialized, and budget, usage limits, active hours and STOP apply to all lanes together.
+ * serialized, and budget, usage limits, forecasts, active hours and STOP apply to all lanes together.
  */
 export class Pipeline {
   private invocationCostUsd = 0;
   private itemsThisInvocation = 0;
   private signal: AbortSignal = new AbortController().signal;
+  /** The phase each item runs now (by index), so a stop can record its time before the report. */
+  private readonly openPhases = new Map<number, { phase: Phase; startedAt: number }>();
+  /** Time each item spent in usage, schedule and forecast waits, so its time can leave it out. */
+  private readonly waitedMs = new Map<number, number>();
+  /** When each item's running step started, and its `waitedMs` then. */
+  private readonly stepClocks = new Map<number, { at: number; waited: number }>();
   /** More than one lane: item-level stops park their lane instead of ending the run. */
   private readonly parallel: boolean;
-  /** With lanes: the run-wide stop (STOP, usage, schedule, disk, budget) every lane obeys. */
-  private runStop: Exit | undefined;
+  /** With lanes: the run-wide stop (STOP, usage, schedule, forecast, disk, budget) every lane obeys. */
+  private runStop: RunStop | undefined;
   /** With lanes: a lane stopped, so the others finish their current item and no new item starts. */
   private draining = false;
   /** With lanes: why the last item to end found nothing left, for the final "done". */
   private doneReason: string | undefined;
+  /** With lanes on GitHub issues: the queue was empty at the last look. */
+  private issuesExhausted = false;
   /** USD promised to Claude steps that are running right now (the invocation budget is shared). */
   private reservedUsd = 0;
   private budgetFreed: Array<() => void> = [];
@@ -209,53 +272,137 @@ export class Pipeline {
 
   async run(options: InvocationOptions): Promise<Exit> {
     this.signal = options.signal;
-    if (this.state.status === "done" || this.state.items.length === 0) {
+    if (this.parallel) return this.runParallel(options);
+    const item = this.state.item;
+    // A run on GitHub issues may sit between items: it picks the next issue itself.
+    if (this.state.status === "done" || (item === undefined && !this.fromIssues())) {
       return {
         kind: "done",
         reason: this.state.haltReason ?? "run already finished",
         state: this.state,
       };
     }
-    if (this.parallel && this.deps.worktrees === undefined) {
-      throw new Error("parallel lanes need git worktrees, but none were provided");
+    if (options.answer !== undefined) {
+      if (item?.pendingQuestion === undefined) {
+        throw new Error("the run is not waiting for an answer (no open question)");
+      }
+      item.pendingAnswer = options.answer;
+      await this.answeredLocally(item);
+    } else if (item?.pendingQuestion !== undefined && item.pendingAnswer === undefined) {
+      if (!(await this.answerFromGitHub(item))) {
+        await this.save();
+        const where =
+          item.questionPost === undefined
+            ? "use --answer"
+            : `reply on ${item.questionPost.url}, or use --answer`;
+        throw new Error(`the run is waiting for an answer: ${item.pendingQuestion}\n${where}`);
+      }
     }
-    this.takeAnswer(options.answer, options.answerItem);
-    for (const item of this.state.items) this.freshStart(item);
+    if (item !== undefined) this.freshStart(item);
     const maxItems = options.maxItems ?? this.deps.config.limits.max_items;
     this.state.status = "running";
     delete this.state.haltReason;
+    delete this.state.stop;
     this.deps.host.clearStop();
     await this.save();
-    const first = this.state.items[0];
-    await this.event({
-      type: "invocation_start",
-      item: first?.index,
-      phase: first?.phase,
-      ...(this.parallel
-        ? { lanes: this.deps.config.limits.lanes, items: this.state.items.map((i) => i.index) }
-        : {}),
-    });
-    return this.parallel ? this.runLanes(maxItems) : this.runSingle(maxItems);
+    await this.event({ type: "invocation_start", item: item?.index, phase: item?.phase });
+    if (item?.issue !== undefined) await this.unflagIssue(item, item.issue);
+
+    try {
+      for (;;) {
+        if (this.signal.aborted) throw new Aborted();
+        if (this.deps.host.stopRequested()) {
+          this.deps.host.clearStop();
+          return await this.pause("stop requested (STOP file)", "stop_requested");
+        }
+        let current = this.state.item;
+        if (current === undefined) {
+          if (!this.fromIssues()) return await this.finish("no task left");
+          const picked = await this.startNextIssue();
+          if (typeof picked === "string") return await this.finish(picked);
+          if (!("index" in picked)) return picked.exit;
+          current = picked;
+        }
+        const exit = await this.step(current);
+        if (exit) return exit;
+        if (current !== this.state.item && maxItems > 0 && this.itemsThisInvocation >= maxItems) {
+          return await this.pause(`item limit reached (${maxItems} this invocation)`, "item_limit");
+        }
+      }
+    } catch (error) {
+      if (error instanceof Aborted || this.signal.aborted) {
+        // SIGTERM is a shutdown or a service stop, not a person choosing to stop the run.
+        return this.signal.reason === "SIGTERM"
+          ? await this.halt("terminated (SIGTERM)", "halted", "terminated")
+          : await this.halt("interrupted", "halted", "interrupted");
+      }
+      return await this.halt(`error: ${(error as Error).message}`, "halted");
+    }
   }
 
-  /** Attaches `answer` to the item waiting for it; refuses to run when every item is waiting. */
-  private takeAnswer(answer: string | undefined, answerItem: number | undefined): void {
-    const waiting = this.state.items.filter((i) => i.pendingQuestion !== undefined);
+  // ── parallel lanes ──────────────────────────────────────────────────────
+
+  /** `run` with more than one lane: every item in progress gets a lane, up to `[limits] lanes`. */
+  private async runParallel(options: InvocationOptions): Promise<Exit> {
+    if (this.deps.worktrees === undefined) {
+      throw new Error("parallel lanes need git worktrees, but none were provided");
+    }
+    if (this.state.status === "done" || (runItems(this.state).length === 0 && !this.fromIssues())) {
+      return {
+        kind: "done",
+        reason: this.state.haltReason ?? "run already finished",
+        state: this.state,
+      };
+    }
+    await this.takeAnswers(options.answer, options.answerItem);
+    const items = runItems(this.state);
+    for (const item of items) this.freshStart(item);
+    const maxItems = options.maxItems ?? this.deps.config.limits.max_items;
+    this.state.status = "running";
+    delete this.state.haltReason;
+    delete this.state.stop;
+    this.state.nextIndex ??= this.usedIndex() + 1;
+    this.deps.host.clearStop();
+    await this.save();
+    await this.event({
+      type: "invocation_start",
+      item: items[0]?.index,
+      phase: items[0]?.phase,
+      lanes: this.deps.config.limits.lanes,
+      items: items.map((i) => i.index),
+    });
+    for (const item of items) {
+      if (item.issue !== undefined) await this.unflagIssue(item, item.issue);
+    }
+    return this.runLanes(maxItems);
+  }
+
+  /**
+   * Attaches an answer given with `--answer` to the item waiting for it, and looks on GitHub for
+   * answers to the others. Refuses to run only when nothing could start: every item waits for an
+   * answer and no free lane can take a new issue.
+   */
+  private async takeAnswers(
+    answer: string | undefined,
+    answerItem: number | undefined,
+  ): Promise<void> {
+    const items = runItems(this.state);
+    const waiting = items.filter((i) => i.pendingQuestion !== undefined);
     if (answer !== undefined) {
       let target: ItemState | undefined;
       if (answerItem !== undefined) {
-        target = this.state.items.find((i) => i.index === answerItem);
+        target = items.find((i) => i.index === answerItem);
         if (target === undefined) throw new Error(`there is no item ${answerItem} in this run`);
         if (target.pendingQuestion === undefined) {
           throw new Error(`item ${answerItem} is not waiting for an answer (no open question)`);
         }
       } else {
-        const unanswered = waiting.filter((i) => i.pendingAnswer === undefined);
-        target =
-          waiting.length === 1 ? waiting[0] : unanswered.length === 1 ? unanswered[0] : undefined;
         if (waiting.length === 0) {
           throw new Error("the run is not waiting for an answer (no open question)");
         }
+        const unanswered = waiting.filter((i) => i.pendingAnswer === undefined);
+        target =
+          waiting.length === 1 ? waiting[0] : unanswered.length === 1 ? unanswered[0] : undefined;
         if (target === undefined) {
           throw new Error(
             `several items are waiting for an answer; pick one with --item:\n${waiting.map((i) => `  item ${i.index}: ${i.pendingQuestion}`).join("\n")}`,
@@ -263,12 +410,28 @@ export class Pipeline {
         }
       }
       target.pendingAnswer = answer;
-      return;
+      await this.answeredLocally(target);
     }
-    const runnable = this.state.items.some((i) => !this.awaitingAnswer(i));
-    const open = waiting.find((i) => i.pendingAnswer === undefined);
-    if (!runnable && open !== undefined) {
-      throw new Error(`the run is waiting for an answer: ${open.pendingQuestion}\nuse --answer`);
+    for (const item of items) {
+      if (this.awaitingAnswer(item)) await this.answerFromGitHub(item);
+    }
+    const open = items.filter((i) => this.awaitingAnswer(i));
+    const canStart =
+      items.some((i) => !this.awaitingAnswer(i)) ||
+      (this.fromIssues() && items.length < this.deps.config.limits.lanes);
+    if (!canStart && open.length > 0) {
+      await this.save();
+      const lines = open.map((i) => {
+        const where = i.questionPost === undefined ? "" : ` (reply on ${i.questionPost.url})`;
+        return `  item ${i.index}: ${i.pendingQuestion}${where}`;
+      });
+      const how =
+        open.length === 1 ? "use --answer" : 'use --answer "…" --item N, or reply on GitHub';
+      throw new Error(
+        open.length === 1
+          ? `the run is waiting for an answer: ${open[0]?.pendingQuestion}\n${open[0]?.questionPost === undefined ? "use --answer" : `reply on ${open[0].questionPost.url}, or use --answer`}`
+          : `the run is waiting for answers:\n${lines.join("\n")}\n${how}`,
+      );
     }
   }
 
@@ -276,53 +439,41 @@ export class Pipeline {
     return item.pendingQuestion !== undefined && item.pendingAnswer === undefined;
   }
 
-  /** One lane: the item runs in the repository's own checkout, and any stop ends the run. */
-  private async runSingle(maxItems: number): Promise<Exit> {
-    try {
-      for (;;) {
-        if (this.signal.aborted) throw new Aborted();
-        const stop = await this.stopRequest();
-        if (stop) return stop;
-        const current = this.state.items[0];
-        if (current === undefined) return await this.finish("no task left");
-        const exit = await this.step(current);
-        if (exit) return exit;
-        if (
-          current !== this.state.items[0] &&
-          maxItems > 0 &&
-          this.itemsThisInvocation >= maxItems
-        ) {
-          return await this.pause(`item limit reached (${maxItems} this invocation)`);
-        }
-      }
-    } catch (error) {
-      if (error instanceof Aborted || this.signal.aborted) {
-        return await this.halt("interrupted", "halted");
-      }
-      return await this.halt(`error: ${(error as Error).message}`, "halted");
-    }
-  }
-
   /**
-   * Several lanes: starts a lane for every runnable item, up to `[limits] lanes` (and no more than
-   * `maxItems` allows), and starts new lanes as items finish and hand over next items. Ends when no
-   * lane is running and none can start.
+   * Starts a lane for every runnable item, up to `[limits] lanes` (and no more than `maxItems`
+   * allows), takes new issues for free lanes, and starts new lanes as items finish and hand over
+   * next items. Ends when no lane is running and none can start.
    */
   private async runLanes(maxItems: number): Promise<Exit> {
     const running = new Map<ItemState, Promise<void>>();
+    let picker: Promise<void> | undefined;
     for (;;) {
       if (this.runStop === undefined && !this.draining && !this.signal.aborted) {
-        for (const item of this.state.items) {
+        for (const item of runItems(this.state)) {
           if (running.size >= this.laneLimit(maxItems)) break;
           if (running.has(item) || item.stopped !== undefined || this.awaitingAnswer(item)) {
             continue;
           }
-          const lane = this.lane(item).finally(() => running.delete(item));
-          running.set(item, lane);
+          running.set(
+            item,
+            this.lane(item).finally(() => running.delete(item)),
+          );
+        }
+        // With GitHub issues, a free lane takes the next issue (one pick at a time).
+        if (
+          picker === undefined &&
+          this.fromIssues() &&
+          !this.issuesExhausted &&
+          running.size < this.laneLimit(maxItems) &&
+          runItems(this.state).length < this.deps.config.limits.lanes
+        ) {
+          picker = this.pickForLane().finally(() => {
+            picker = undefined;
+          });
         }
       }
-      if (running.size === 0) break;
-      await Promise.race(running.values());
+      if (running.size === 0 && picker === undefined) break;
+      await Promise.race(picker === undefined ? running.values() : [...running.values(), picker]);
     }
     return this.concludeLanes(maxItems);
   }
@@ -337,7 +488,7 @@ export class Pipeline {
   private async lane(item: ItemState): Promise<void> {
     this.log(item, `lane started (phase ${item.phase})`);
     try {
-      while (this.state.items.includes(item)) {
+      while (runItems(this.state).includes(item)) {
         if (this.signal.aborted) return;
         const stop = await this.stopRequest();
         if (stop) return;
@@ -351,7 +502,7 @@ export class Pipeline {
         await this.stopLane(item, reason, "halted");
       } catch {
         // Recording the stop failed too (e.g. the state file cannot be written): stop in memory.
-        item.stopped = { kind: "halted", reason };
+        item.stopped = { kind: "halted", reason, cause: "failure" };
         this.draining = true;
       }
     } finally {
@@ -364,34 +515,89 @@ export class Pipeline {
    * either, its item is parked rather than restarted at once, so the scheduler cannot spin.
    */
   private laneEnded(item: ItemState): void {
+    // An item left: the issue queue may have changed meanwhile, so look at it again.
+    if (!runItems(this.state).includes(item)) this.issuesExhausted = false;
     const accounted =
-      !this.state.items.includes(item) ||
+      !runItems(this.state).includes(item) ||
       item.stopped !== undefined ||
       this.awaitingAnswer(item) ||
       this.runStop !== undefined ||
       this.signal.aborted;
     if (accounted) return;
-    item.stopped = { kind: "halted", reason: `lane ended in phase ${item.phase} without a result` };
+    item.stopped = {
+      kind: "halted",
+      reason: `lane ended in phase ${item.phase} without a result`,
+      cause: "failure",
+    };
     this.draining = true;
+  }
+
+  /**
+   * With lanes on GitHub issues: takes the next issue for a free lane, after the same gates as a
+   * single lane (active hours, usage limits and the forecast, which counts the items in progress).
+   */
+  private async pickForLane(): Promise<void> {
+    try {
+      const ready = await this.issueQueue();
+      if (ready.queue.length === 0) {
+        this.issuesExhausted = true;
+        this.doneReason = ready.none;
+        return;
+      }
+      const upcoming = newItem(this.peekIndex(), this.deps.config.tasks.repo, "");
+      upcoming.label = "next issue";
+      const gate = await this.gates(upcoming);
+      if (!gate.ok) return; // a run-wide stop, recorded by the gate
+      // The gate may have waited for hours: don't claim an issue the run will not work on.
+      if (this.runStop !== undefined || this.draining || this.signal.aborted) return;
+      const picked = await this.pickIssue();
+      if (typeof picked === "string") {
+        this.issuesExhausted = true;
+        this.doneReason = picked;
+        return;
+      }
+      picked.startedAt = this.deps.host.now().toISOString();
+      await this.save();
+    } catch (error) {
+      if (error instanceof Aborted || this.signal.aborted) return;
+      await this.halt(`error: ${(error as Error).message}`, "halted");
+    }
   }
 
   /** The exit of a run with lanes, once no lane is running: its worst stop, or done. */
   private async concludeLanes(maxItems: number): Promise<Exit> {
-    if (this.signal.aborted) return this.conclude("halted", "interrupted");
-    const stops: Array<{ kind: Exclude<ExitKind, "done">; reason: string }> = [];
-    if (this.runStop !== undefined && this.runStop.kind !== "done") {
-      stops.push({ kind: this.runStop.kind, reason: this.runStop.reason });
+    if (this.signal.aborted) {
+      return this.signal.reason === "SIGTERM"
+        ? this.conclude("terminated (SIGTERM)", "halted", "terminated")
+        : this.conclude("interrupted", "halted", "interrupted");
     }
-    for (const item of this.state.items) {
+    const stops: Array<{
+      kind: Exclude<ExitKind, "done">;
+      reason: string;
+      cause: StopCause;
+      resumeAt?: Date;
+    }> = [];
+    const runStop = this.runStop;
+    if (runStop !== undefined) {
+      stops.push({
+        kind: runStop.exit.kind,
+        reason: runStop.exit.reason,
+        cause: runStop.cause,
+        ...(runStop.resumeAt === undefined ? {} : { resumeAt: runStop.resumeAt }),
+      });
+    }
+    for (const item of runItems(this.state)) {
       if (item.stopped !== undefined) {
         stops.push({
           kind: item.stopped.kind,
           reason: `[${this.name(item)}] ${item.stopped.reason}`,
+          cause: item.stopped.cause,
         });
       } else if (this.awaitingAnswer(item)) {
         stops.push({
           kind: "blocked",
           reason: `[${this.name(item)}] needs a human: ${item.pendingQuestion}`,
+          cause: "question",
         });
       }
     }
@@ -399,14 +605,29 @@ export class Pipeline {
       const worst = stops.reduce((a, b) => (SEVERITY[b.kind] > SEVERITY[a.kind] ? b : a));
       const reason =
         stops.length === 1 ? worst.reason : stops.map((stop) => stop.reason).join("; ");
-      return this.conclude(worst.kind, reason);
+      // A run-wide failure leaves every issue in progress waiting for a human, too.
+      if (runStop !== undefined && runStop.exit.kind !== "paused") {
+        for (const item of runItems(this.state)) {
+          if (item.stopped === undefined) {
+            await this.noteIssue(item, runStop.exit.reason, runStop.exit.kind);
+          }
+        }
+      }
+      return this.conclude(reason, worst.kind, worst.cause, worst.resumeAt);
     }
-    if (this.state.items.length === 0) return this.finish(this.doneReason ?? "no task left");
+    const items = runItems(this.state);
+    if (items.length === 0 && (!this.fromIssues() || this.issuesExhausted)) {
+      return this.finish(this.doneReason ?? "no task left");
+    }
     if (maxItems > 0 && this.itemsThisInvocation >= maxItems) {
-      return this.pause(`item limit reached (${maxItems} this invocation)`);
+      return this.conclude(
+        `item limit reached (${maxItems} this invocation)`,
+        "paused",
+        "item_limit",
+      );
     }
     // Items remain that no lane could start (laneEnded parks the ones that would spin).
-    return this.conclude("halted", "no lane could make progress");
+    return this.conclude("no lane could make progress", "halted", "failure");
   }
 
   /**
@@ -443,10 +664,54 @@ export class Pipeline {
     }
     item.inFlight = item.phase;
     await this.save();
-    const exit = await this.runPhase(item, restarted);
+    this.openPhases.set(item.index, {
+      phase: item.phase,
+      startedAt: this.deps.host.now().getTime(),
+    });
+    this.stepClocks.set(item.index, {
+      at: this.deps.host.now().getTime(),
+      waited: this.waited(item),
+    });
+    let exit: Exit | undefined;
+    try {
+      exit = await this.runPhase(item, restarted);
+    } finally {
+      // A finished item already counted its time (completeItem); only a current one adds it.
+      if (runItems(this.state).includes(item)) item.activeMs = this.activeMs(item);
+      this.stepClocks.delete(item.index);
+    }
     delete item.inFlight;
     await this.save();
+    await this.closePhase(item.index);
     return exit;
+  }
+
+  /** Records how long an open phase ran (for the report's time per step); all of them without `index`. */
+  private async closePhase(index?: number): Promise<void> {
+    const indexes =
+      index === undefined ? [...this.openPhases.keys()].sort((a, b) => a - b) : [index];
+    for (const at of indexes) {
+      const open = this.openPhases.get(at);
+      if (open === undefined) continue;
+      this.openPhases.delete(at);
+      const durationMs = this.deps.host.now().getTime() - open.startedAt;
+      await this.event({ type: "phase", item: at, phase: open.phase, durationMs });
+    }
+  }
+
+  /** The item's active time, including the running step so far (without its waits). */
+  private activeMs(item: ItemState): number {
+    const clock = this.stepClocks.get(item.index);
+    const step =
+      clock === undefined
+        ? 0
+        : this.deps.host.now().getTime() - clock.at - (this.waited(item) - clock.waited);
+    return Math.max(0, Math.round((item.activeMs ?? 0) + step));
+  }
+
+  /** Time the item has spent in waits during this invocation. */
+  private waited(item: ItemState): number {
+    return this.waitedMs.get(item.index) ?? 0;
   }
 
   private runPhase(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
@@ -474,6 +739,17 @@ export class Pipeline {
   // ── phases ──────────────────────────────────────────────────────────────
 
   private async implement(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
+    if (item.issue !== undefined && item.issue.claimed !== true) {
+      // nightshift stopped between picking the issue and claiming it.
+      const lost = await this.claim(item, item.issue);
+      if (lost !== undefined) {
+        return this.stopLane(
+          item,
+          `issue #${item.issue.number} was claimed elsewhere: ${lost}`,
+          "halted",
+        );
+      }
+    }
     const result = await this.agentStep(item, "implement", implementResult, restarted, {
       handoff: item.handoff,
     });
@@ -484,8 +760,15 @@ export class Pipeline {
       case "blocked":
         return this.blocked(item, r.question ?? r.summary);
       case "all_done":
-        await this.removeItem(item);
-        return this.nothingLeft(`no task left: ${r.summary}`);
+        if (item.issue !== undefined) return this.setIssueAside(item, item.issue, r.summary);
+        if (this.parallel) {
+          // With lanes, the run goes on while other items remain.
+          await this.removeItem(item);
+          this.doneReason = `no task left: ${r.summary}`;
+          return undefined;
+        }
+        delete this.state.item;
+        return this.finish(`no task left: ${r.summary}`);
       case "failed":
         return this.stopLane(item, `implement failed: ${r.summary}`, "halted");
       case "pr_opened": {
@@ -516,7 +799,7 @@ export class Pipeline {
     if (disk) return disk;
     // A review command may well use Claude too (`claude -p "/code-review …"`): it is held to the
     // same limits, and what it uses counts as nightshift's.
-    const gate = await this.gates();
+    const gate = await this.gates(undefined, item);
     if (!gate.ok) return gate.exit;
     this.log(item, `review round ${item.reviewRound}/${review.max_rounds}`);
     const running = this.deps.reviewer.run({
@@ -817,105 +1100,455 @@ export class Pipeline {
   }
 
   private async finalize(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
-    if (this.parallel) return this.finalizeLane(item, restarted);
     const pr = this.requirePr(item);
+    if (item.issue !== undefined) return this.finalizeIssue(item, item.issue, pr, restarted);
+    if (this.parallel) return this.finalizeLane(item, pr, restarted);
     const aliases = Object.keys(this.deps.config.repos) as [string, ...string[]];
     const schema = finalizeResult(aliases);
     const result = await this.agentStep(item, "finalize", schema, restarted, {
       ...this.prVars(pr),
       merge_sha: item.mergeSha ?? "(unknown)",
-      repos: this.repoList(),
+      repos: Object.entries(this.deps.config.repos)
+        .map(([alias, dir]) => `- ${alias}: ${dir}`)
+        .join("\n"),
     });
     if (!result.ok) return result.exit;
     const r = result.value;
     if (r.status === "all_done") {
       await this.completeItem(item);
-      return this.nothingLeft(`no task left: ${r.summary}`);
+      delete this.state.item;
+      return this.finish(`no task left: ${r.summary}`);
     }
     const next =
       r.next_repo !== undefined && r.next_prompt !== undefined && r.next_prompt.trim() !== ""
-        ? [{ repo: r.next_repo, prompt: r.next_prompt }]
-        : [];
-    return this.handOver(item, r.status, next, r.question ?? r.summary);
+        ? newItem(item.index + 1, r.next_repo, r.next_prompt)
+        : undefined;
+    if (r.status === "continue") {
+      if (next === undefined) {
+        return this.stopLane(
+          item,
+          "finalize reported continue without next_repo and next_prompt",
+          "halted",
+        );
+      }
+      await this.completeItem(item);
+      this.state.item = next;
+      return undefined;
+    }
+    // blocked: if the next prompt is known, hand it over and let the answer travel with it.
+    if (next !== undefined) {
+      await this.completeItem(item);
+      this.state.item = next;
+      return this.blocked(next, r.question ?? r.summary);
+    }
+    return this.blocked(item, r.question ?? r.summary);
+  }
+
+  /** Post-merge work for an issue item; the next item comes from the issues, not from Claude. */
+  private async finalizeIssue(
+    item: ItemState,
+    issue: ItemIssue,
+    pr: NonNullable<ItemState["pr"]>,
+    restarted: boolean,
+  ): Promise<Exit | undefined> {
+    if (issue.finalized !== true) {
+      const result = await this.agentStep(item, "finalize-issue", finalizeIssueResult, restarted, {
+        ...this.prVars(pr),
+        merge_sha: item.mergeSha ?? "(unknown)",
+        issue_number: issue.number,
+        issue_url: issue.url,
+        label: this.deps.config.tasks.label,
+      });
+      if (!result.ok) return result.exit;
+      if (result.value.status === "blocked") {
+        return this.blocked(item, result.value.question ?? result.value.summary);
+      }
+      issue.finalized = true;
+      await this.save();
+    }
+    await this.ensureIssueClosed(item, issue, pr);
+    await this.completeItem(item);
+    await this.removeItem(item);
+    return undefined;
   }
 
   /**
    * Finalize with lanes: Claude is told which items are in progress and may hand over as many next
    * items as lanes are free once this one is done, each independent of those in progress.
    */
-  private async finalizeLane(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
-    const pr = this.requirePr(item);
+  private async finalizeLane(
+    item: ItemState,
+    pr: NonNullable<ItemState["pr"]>,
+    restarted: boolean,
+  ): Promise<Exit | undefined> {
     const aliases = Object.keys(this.deps.config.repos) as [string, ...string[]];
-    const others = this.state.items.filter((other) => other !== item);
+    const others = runItems(this.state).filter((other) => other !== item);
     const maxNext = Math.max(1, this.deps.config.limits.lanes - others.length);
     const schema = finalizeLanesResult(aliases, maxNext);
     const result = await this.agentStep(item, "finalize-lanes", schema, restarted, {
       ...this.prVars(pr),
       merge_sha: item.mergeSha ?? "(unknown)",
-      repos: this.repoList(),
+      repos: Object.entries(this.deps.config.repos)
+        .map(([alias, dir]) => `- ${alias}: ${dir}`)
+        .join("\n"),
       lanes: this.deps.config.limits.lanes,
       max_next: maxNext,
       running: others.length === 0 ? "(none)" : others.map((o) => this.describe(o)).join("\n"),
     });
     if (!result.ok) return result.exit;
     const r = result.value;
+    const question = r.question ?? r.summary;
     if (r.status === "all_done") {
       await this.completeItem(item);
-      return this.nothingLeft(`no task left: ${r.summary}`);
-    }
-    const next = (r.next ?? []).filter((n) => n.prompt.trim() !== "");
-    if (r.status === "continue" && next.length === 0 && others.length > 0) {
-      // Everything left waits on items in progress; their finalize steps pick it up.
-      await this.completeItem(item);
-      this.log(item, "nothing can start in parallel right now");
+      await this.removeItem(item);
+      this.doneReason = `no task left: ${r.summary}`;
       return undefined;
     }
-    return this.handOver(item, r.status, next, r.question ?? r.summary);
-  }
-
-  /** Completes `item` and queues the next items finalize handed over. */
-  private async handOver(
-    item: ItemState,
-    status: "continue" | "blocked",
-    next: ReadonlyArray<{ repo: string; prompt: string }>,
-    question: string,
-  ): Promise<Exit | undefined> {
-    if (status === "continue") {
-      if (next.length === 0) {
-        return this.stopLane(
-          item,
-          this.parallel
-            ? "finalize reported continue without next items"
-            : "finalize reported continue without next_repo and next_prompt",
-          "halted",
-        );
+    const next = (r.next ?? []).filter((n) => n.prompt.trim() !== "");
+    if (r.status === "continue") {
+      if (next.length === 0 && others.length === 0) {
+        return this.stopLane(item, "finalize reported continue without next items", "halted");
       }
+      // With none: everything left waits on items in progress, whose finalize picks it up.
       await this.completeItem(item);
+      await this.removeItem(item);
+      if (next.length === 0) this.log(item, "nothing can start in parallel right now");
       this.queue(next);
       return undefined;
     }
     // blocked: if the next prompt is known, hand it over and let the answer travel with it.
     if (next.length > 0) {
       await this.completeItem(item);
+      await this.removeItem(item);
       const [first] = this.queue(next);
       if (first !== undefined) return this.blocked(first, question);
     }
     return this.blocked(item, question);
   }
 
-  /** Adds handed-over items to the run, with fresh indexes. */
+  /** With lanes: adds handed-over items to the run, with fresh indexes. */
   private queue(next: ReadonlyArray<{ repo: string; prompt: string }>): ItemState[] {
-    const added = next.map(({ repo, prompt }) => newItem(this.state.nextIndex++, repo, prompt));
-    this.state.items.push(...added);
+    const added = next.map(({ repo, prompt }) => newItem(this.takeIndex(), repo, prompt));
+    setRunItems(this.state, [...runItems(this.state), ...added]);
     for (const item of added) this.log(item, `handed over (repo ${item.repo})`);
     return added;
   }
 
-  /** An item ended with "no task left": with lanes, the run goes on while other items remain. */
-  private nothingLeft(reason: string): Promise<Exit> | undefined {
-    if (!this.parallel) return this.finish(reason);
-    this.doneReason = reason;
+  /** The highest item index this run has used. */
+  private usedIndex(): number {
+    return Math.max(
+      0,
+      this.state.itemsCompleted,
+      this.state.issues?.picked ?? 0,
+      ...runItems(this.state).map((i) => i.index),
+    );
+  }
+
+  /** With lanes: the index the next item gets. */
+  private peekIndex(): number {
+    return Math.max(this.state.nextIndex ?? 1, this.usedIndex() + 1);
+  }
+
+  private takeIndex(): number {
+    const index = this.peekIndex();
+    this.state.nextIndex = index + 1;
+    return index;
+  }
+
+  // ── GitHub issues as the task source ───────────────────────────────────
+
+  /** Issues not to pick: those this run set aside, and those other lanes are working on. */
+  private excludedIssues(): Set<number> {
+    const exclude = new Set(this.state.issues?.skipped ?? []);
+    for (const item of runItems(this.state)) {
+      if (item.issue !== undefined) exclude.add(item.issue.number);
+    }
+    return exclude;
+  }
+
+  private fromIssues(): boolean {
+    return this.deps.config.tasks.source === "github_issues";
+  }
+
+  /**
+   * Starts the next issue item, but only once a new item may start: inside active hours, within
+   * the usage limits and, with forecasts, when a typical item fits. Those gates run before the
+   * issue is claimed, so a wait or pause never holds a claim; implement then does not repeat the
+   * forecast. Returns why there is no issue left, or the exit a gate took.
+   */
+  private async startNextIssue(): Promise<ItemState | string | { exit: Exit }> {
+    const ready = await this.issueQueue();
+    if (ready.queue.length === 0) return ready.none;
+    const index = (this.state.issues?.picked ?? this.state.itemsCompleted) + 1;
+    const upcoming = newItem(index, this.deps.config.tasks.repo, "");
+    upcoming.label = "next issue";
+    const gate = await this.gates(upcoming);
+    if (!gate.ok) return { exit: gate.exit };
+    const picked = await this.pickIssue();
+    if (typeof picked !== "string") picked.startedAt = this.deps.host.now().toISOString();
+    return picked;
+  }
+
+  /** The issues nightshift may pick now, best first, and what to say when there are none. */
+  private async issueQueue(): Promise<{ slug: string; me: string; queue: Issue[]; none: string }> {
+    const { forge, config } = this.deps;
+    const { tasks } = config;
+    const slug = await forge.repoSlug(this.repoDir(tasks.repo));
+    const me = await forge.currentUser();
+    const exclude = this.excludedIssues();
+    const { queue } = rankIssues(await forge.listIssues(slug, tasks.label), tasks, me, exclude);
+    return {
+      slug,
+      me,
+      queue,
+      none: `no open issue labelled "${tasks.label}" is left to do in ${slug}`,
+    };
+  }
+
+  /**
+   * Picks the next open issue, makes it the current item and claims it. Returns why there is none
+   * when no issue is left.
+   */
+  private async pickIssue(): Promise<ItemState | string> {
+    const { forge, config } = this.deps;
+    const { tasks } = config;
+    // Listed again: a gate before this may have waited for hours.
+    const { slug, me, queue, none } = await this.issueQueue();
+    this.state.issues ??= {};
+    const runIssues = this.state.issues;
+    const exclude = this.excludedIssues();
+    for (const candidate of queue) {
+      // The listing has no bodies, and the issue may have changed since: read it again.
+      const issue = await forge.issue(slug, candidate.number);
+      const why = ineligible(issue, tasks, me, exclude);
+      if (why !== undefined) {
+        this.deps.host.log(`skipping issue #${issue.number}: ${why}`);
+        continue;
+      }
+      const index = this.parallel
+        ? this.takeIndex()
+        : (runIssues.picked ?? this.state.itemsCompleted) + 1;
+      const instructions = runIssues.instructions?.trim() ?? "";
+      const handoff = render(this.deps.templates.issue, {
+        issue_number: issue.number,
+        issue_title: issue.title,
+        issue_url: issue.url,
+        issue_author: issue.author || "unknown",
+        issue_body: issue.body.trim() === "" ? "(no description)" : issue.body.trim(),
+        repo_slug: slug,
+        label: tasks.label,
+        instructions:
+          instructions === "" ? "" : `\n## Instructions for this run\n\n${instructions}\n`,
+      });
+      const item = newItem(index, tasks.repo, handoff);
+      item.label = `#${issue.number} ${issue.title}`;
+      item.issue = { number: issue.number, title: issue.title, url: issue.url, repoSlug: slug };
+      runIssues.picked = index;
+      if (this.parallel) setRunItems(this.state, [...runItems(this.state), item]);
+      else this.state.item = item;
+      await this.save();
+      await this.event({ type: "issue_picked", item: index, issue: issue.url });
+      this.log(item, `picked issue ${issue.url}`);
+      const lost = await this.claim(item, item.issue, issue);
+      if (lost === undefined) return item;
+      this.log(item, `lost issue #${issue.number} to another claim (${lost}); trying the next one`);
+      const lostIssue = item.issue;
+      await this.github(item, `release issue #${issue.number}`, () =>
+        releaseClaim(forge, lostIssue),
+      );
+      exclude.add(issue.number);
+      await this.removeItem(item);
+      await this.save();
+    }
+    return none;
+  }
+
+  /**
+   * Claims the issue for this run: the in-progress label and/or an assignment to nightshift's
+   * account. What it adds is recorded before it is added, so a crash in between still releases it.
+   * Returns why the claim was lost to someone else, or undefined.
+   */
+  private async claim(
+    item: ItemState,
+    issue: ItemIssue,
+    current?: Issue,
+  ): Promise<string | undefined> {
+    const { forge } = this.deps;
+    const { tasks } = this.deps.config;
+    const me = await forge.currentUser();
+    const before = current ?? (await forge.issue(issue.repoSlug, issue.number));
+    if (tasks.in_progress_label !== "") issue.claimLabel ??= tasks.in_progress_label;
+    if (tasks.assign && issue.assignee === undefined && !before.assignees.includes(me)) {
+      issue.assignee = me;
+    }
+    await this.save();
+    if (issue.claimLabel !== undefined) {
+      await forge.ensureLabel(
+        issue.repoSlug,
+        issue.claimLabel,
+        IN_PROGRESS_COLOR,
+        IN_PROGRESS_DESCRIPTION,
+      );
+    }
+    await forge.editIssue(issue.repoSlug, issue.number, {
+      addLabels:
+        issue.claimLabel !== undefined && !hasLabel(before, issue.claimLabel)
+          ? [issue.claimLabel]
+          : [],
+      addAssignees:
+        issue.assignee !== undefined && !before.assignees.includes(issue.assignee)
+          ? [issue.assignee]
+          : [],
+    });
+    const after = await forge.issue(issue.repoSlug, issue.number);
+    const others = after.assignees.filter((login) => login.toLowerCase() !== me.toLowerCase());
+    if (others.length > 0) return `assigned to ${others.join(", ")}`;
+    issue.claimed = true;
+    await this.save();
+    await this.event({ type: "issue_claimed", item: item.index, issue: issue.url });
     return undefined;
+  }
+
+  /**
+   * Claude found nothing to change for this issue: say so on the issue, label it for a human, let
+   * go of it and go on with the next issue. GitHub errors here are logged, not fatal: the run has
+   * already decided, and `skipped` keeps it from picking the issue again.
+   */
+  private async setIssueAside(
+    item: ItemState,
+    issue: ItemIssue,
+    summary: string,
+  ): Promise<undefined> {
+    const { forge } = this.deps;
+    const blocked = this.deps.config.tasks.blocked_label;
+    this.log(item, `no change needed for issue #${issue.number}; setting it aside`);
+    await this.github(item, `set issue #${issue.number} aside`, async () => {
+      const relabel =
+        blocked === ""
+          ? ""
+          : ` It is labelled \`${blocked}\` so nightshift does not pick it again; remove the label to queue it again, or close the issue.`;
+      await forge.commentIssue(
+        issue.repoSlug,
+        issue.number,
+        `**nightshift** looked at this issue and opened no pull request:\n\n${quote(summary)}\n\n${relabel.trim()}`.trim(),
+      );
+      if (blocked !== "") {
+        await forge.ensureLabel(issue.repoSlug, blocked, BLOCKED_COLOR, BLOCKED_DESCRIPTION);
+        await forge.editIssue(issue.repoSlug, issue.number, { addLabels: [blocked] });
+      }
+      await releaseClaim(forge, issue);
+    });
+    this.state.issues ??= {};
+    this.state.issues.skipped = [...(this.state.issues.skipped ?? []), issue.number];
+    await this.event({ type: "issue_set_aside", item: item.index, issue: issue.url, summary });
+    await this.removeItem(item);
+    await this.save();
+    return undefined;
+  }
+
+  /**
+   * After the merge: the PR's `Closes #N` normally closed the issue already; if not, close it with a
+   * comment linking the PR. The in-progress label comes off; the assignee stays as a record.
+   */
+  private async ensureIssueClosed(
+    item: ItemState,
+    issue: ItemIssue,
+    pr: NonNullable<ItemState["pr"]>,
+  ): Promise<void> {
+    const { forge } = this.deps;
+    let current = await forge.issue(issue.repoSlug, issue.number);
+    if (current.state === "OPEN") {
+      await forge.closeIssue(
+        issue.repoSlug,
+        issue.number,
+        `Fixed by ${pr.url}${item.mergeSha === undefined ? "" : ` (merged as ${item.mergeSha})`}. Closed by nightshift.`,
+      );
+      current = await forge.issue(issue.repoSlug, issue.number);
+      if (current.state !== "CLOSED") {
+        throw new Error(`issue #${issue.number} is still open after closing it`);
+      }
+      this.log(item, `closed issue ${issue.url}`);
+      await this.event({
+        type: "issue_closed",
+        item: item.index,
+        issue: issue.url,
+        by: "nightshift",
+      });
+    } else {
+      this.log(item, `issue ${issue.url} is closed`);
+      await this.event({ type: "issue_closed", item: item.index, issue: issue.url, by: "github" });
+    }
+    const label = issue.claimLabel;
+    if (label !== undefined && hasLabel(current, label)) {
+      await this.github(item, `remove label "${label}"`, () =>
+        forge.editIssue(issue.repoSlug, issue.number, { removeLabels: [label] }),
+      );
+    }
+  }
+
+  /**
+   * The run stopped on an issue item and needs a human: label the issue and say why on it (once
+   * per distinct reason, across resumes). Best effort: a GitHub failure here must not hide the stop.
+   */
+  private async noteIssue(
+    item: ItemState | undefined,
+    reason: string,
+    kind: "halted" | "blocked",
+  ): Promise<void> {
+    const issue = item?.issue;
+    if (item === undefined || issue === undefined) return;
+    const { forge } = this.deps;
+    const blocked = this.deps.config.tasks.blocked_label;
+    const post = kind === "blocked" ? item.questionPost : undefined;
+    if (post !== undefined && post.repoSlug === issue.repoSlug && post.number === issue.number) {
+      issue.noted = reason; // the question itself is on this issue already
+    }
+    if (issue.noted !== reason) {
+      await this.github(item, `comment on issue #${issue.number}`, async () => {
+        const next =
+          kind !== "blocked"
+            ? "Once the cause is fixed, `nightshift resume` continues; `nightshift run --force` abandons the run and releases this issue."
+            : post !== undefined
+              ? `It needs an answer: reply on ${post.url}, and nightshift continues.`
+              : 'It needs an answer: whoever runs nightshift continues with `nightshift resume --answer "…"`.';
+        const pr = item.pr === undefined ? "" : `\n\nPull request: ${item.pr.url}`;
+        await forge.commentIssue(
+          issue.repoSlug,
+          issue.number,
+          `**nightshift stopped** on this issue (run \`${this.state.runId}\`, step \`${item.phase}\`):\n\n${quote(reason)}${pr}\n\n${next}`,
+        );
+        issue.noted = reason;
+      });
+    }
+    if (blocked !== "" && issue.flagged === undefined) {
+      await this.github(item, `label issue #${issue.number} "${blocked}"`, async () => {
+        await forge.ensureLabel(issue.repoSlug, blocked, BLOCKED_COLOR, BLOCKED_DESCRIPTION);
+        await forge.editIssue(issue.repoSlug, issue.number, { addLabels: [blocked] });
+        issue.flagged = blocked;
+      });
+    }
+  }
+
+  /** On `resume`: a human has looked at it, so the blocked label comes off again. */
+  private async unflagIssue(item: ItemState, issue: ItemIssue): Promise<void> {
+    const label = issue.flagged;
+    if (label === undefined) return;
+    await this.github(item, `remove label "${label}"`, async () => {
+      await this.deps.forge.editIssue(issue.repoSlug, issue.number, { removeLabels: [label] });
+      delete issue.flagged;
+    });
+    await this.save();
+  }
+
+  /** Runs a GitHub update whose failure should be logged and recorded, not stop the run. */
+  private async github(item: ItemState, what: string, body: () => Promise<void>): Promise<void> {
+    try {
+      await body();
+    } catch (error) {
+      const message = (error as Error).message;
+      this.log(item, `could not ${what}: ${message}`);
+      await this.event({ type: "issue_update_failed", item: item.index, what, error: message });
+    }
   }
 
   // ── helpers ─────────────────────────────────────────────────────────────
@@ -987,8 +1620,12 @@ export class Pipeline {
     vars: Record<string, string | number>,
     left: number,
   ): Promise<StepOutcome<z.infer<S>>> {
-    const gate = await this.gates();
+    // A new item (not a restart or resume of one already under way) starts only if the forecast
+    // says it fits in what is left of the usage limits and the active hours.
+    const fresh = template === "implement" && !restarted && item.startedAt === undefined;
+    const gate = await this.gates(fresh ? item : undefined, item);
     if (!gate.ok) return gate;
+    if (fresh) item.startedAt = this.deps.host.now().toISOString();
     // Cleared only once the step really starts again, so a pause before then keeps the restart.
     delete item.interruptedPhase;
 
@@ -1020,8 +1657,22 @@ export class Pipeline {
     // A fresh session is only for a first implement attempt; every later step resumes the item's
     // session so Claude keeps the context of this item (and only this item).
     const resume = item.sessionId;
-    this.log(item, `${template}${resume ? "" : " (fresh session)"} · budget $${left.toFixed(2)}`);
-    let call = await this.callAgent(item, template, prompt, schema, left, resume, gate.before);
+    // A resumed session may switch models between steps; Claude Code carries the context over.
+    const settings = stepSettings(this.deps.config.agent, STEP_OF_TEMPLATE[template]);
+    this.log(
+      item,
+      `${template}${resume ? "" : " (fresh session)"} · model ${settings.model ?? "default"} · budget $${left.toFixed(2)}`,
+    );
+    let call = await this.callAgent(
+      item,
+      template,
+      prompt,
+      schema,
+      settings,
+      left,
+      resume,
+      gate.before,
+    );
     if (
       call.cut === undefined &&
       call.result.outcome === "error" &&
@@ -1034,13 +1685,14 @@ export class Pipeline {
         `could not resume session (${call.result.detail}); retrying in a fresh session`,
       );
       delete item.sessionId;
-      const again = await this.gates();
+      const again = await this.gates(undefined, item);
       if (!again.ok) return again;
       call = await this.callAgent(
         item,
         template,
         prompt,
         schema,
+        settings,
         left - call.result.costUsd,
         undefined,
         again.before,
@@ -1067,7 +1719,17 @@ export class Pipeline {
           // interrupted step that is resumed gets it again instead of losing it.
           delete item.pendingAnswer;
           delete item.pendingQuestion;
+          delete item.questionPost;
           await this.save();
+          const data = parsed.data as { status?: unknown; summary?: unknown; item?: unknown };
+          await this.event({
+            type: "result",
+            item: item.index,
+            step: template,
+            status: data.status,
+            summary: data.summary,
+            label: typeof data.item === "string" ? data.item : item.label,
+          });
           return { ok: true, value: parsed.data };
         }
         const issues = parsed.error.issues
@@ -1110,6 +1772,7 @@ export class Pipeline {
     template: TemplateName,
     prompt: string,
     schema: z.ZodType,
+    settings: StepSettings,
     maxBudgetUsd: number,
     resumeSessionId: string | undefined,
     usageBefore: UsageWindows | undefined,
@@ -1128,6 +1791,9 @@ export class Pipeline {
           prompt,
           schema: toJsonSchema(schema),
           ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+          ...(settings.model === undefined ? {} : { model: settings.model }),
+          maxTurns: settings.maxTurns,
+          permissionMode: settings.permissionMode,
           maxBudgetUsd,
           artifactPath: this.artifact(item, `${template}-${attempt}.jsonl`),
           signal: watch === undefined ? this.signal : AbortSignal.any([this.signal, guard.signal]),
@@ -1153,6 +1819,7 @@ export class Pipeline {
       type: "agent",
       item: item.index,
       step: template,
+      ...(settings.model === undefined ? {} : { model: settings.model }),
       outcome: result.outcome,
       costUsd: result.costUsd,
       sessionId: result.sessionId,
@@ -1171,7 +1838,7 @@ export class Pipeline {
    * window to reset (on_limit = "wait") or pauses the run (on_limit = "halt"). Returns the reading
    * the step's own usage is measured from; undefined when no limits are configured.
    */
-  private async usageGate(): Promise<UsageGate> {
+  private async usageGate(lane: ItemState | undefined): Promise<UsageGate> {
     const limits = this.usageLimits();
     if (!limitsEnabled(limits)) return { ok: true, before: undefined };
     const { usage } = this.deps.config;
@@ -1211,6 +1878,8 @@ export class Pipeline {
           ok: false,
           exit: await this.pause(
             `usage limit: ${hit.reason}; the ${WINDOW_LABEL[hit.window]} window resets ${formatTime(hit.resetsAt, now)}`,
+            "usage_limit",
+            new Date(until),
           ),
         };
       }
@@ -1219,6 +1888,7 @@ export class Pipeline {
         `usage limit: ${hit.reason}`,
         `for the ${WINDOW_LABEL[hit.window]} window to reset`,
         "usage_wait",
+        lane,
       );
       if (stopped) return { ok: false, exit: stopped };
     }
@@ -1227,22 +1897,120 @@ export class Pipeline {
   /**
    * Everything that must hold before Claude work starts: inside active hours and within the usage
    * limits. A long usage wait can end outside active hours, so both are checked until both hold.
+   * `lane` is the item whose step waits, so its active time leaves the wait out.
    */
-  private async gates(): Promise<UsageGate> {
+  private async gates(newItem?: ItemState, lane?: ItemState): Promise<UsageGate> {
     for (;;) {
-      const outside = await this.scheduleGate();
+      const outside = await this.scheduleGate(lane);
       if (outside) return { ok: false, exit: outside };
-      const gate = await this.usageGate();
+      const gate = await this.usageGate(lane);
       if (!gate.ok) return gate;
-      if (isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) return gate;
+      if (!isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) continue;
+      if (newItem === undefined) return gate;
+      const fit = await this.forecastGate(newItem, gate.before, lane);
+      if (fit === undefined) return gate;
+      if (fit !== "waited") return { ok: false, exit: fit };
     }
+  }
+
+  /** `[usage] start_item_only_if_it_fits`, which defaults to on when limits or hours are set. */
+  private forecastEnabled(): boolean {
+    const { usage, schedule } = this.deps.config;
+    return (
+      usage.start_item_only_if_it_fits ??
+      (limitsEnabled(this.usageLimits()) || schedule.active_hours.length > 0)
+    );
+  }
+
+  /**
+   * Before a new item: estimates a typical item from history and, when it would not fit in what is
+   * left of the usage limits or the active hours, waits for the window reset or the next active
+   * range (or pauses, following on_limit / outside_hours) instead of starting an item that would
+   * be cut half-way. Returns undefined to start, "waited" to check everything again, or an exit.
+   */
+  private async forecastGate(
+    item: ItemState,
+    windows: UsageWindows | undefined,
+    lane: ItemState | undefined,
+  ): Promise<Exit | "waited" | undefined> {
+    if (!this.forecastEnabled()) return undefined;
+    const { usage, schedule, dir } = this.deps.config;
+    const now = this.deps.host.now();
+    const estimate = estimateItem(await readHistory(dir), usage.forecast_percentile);
+    // With lanes, the items running alongside will use more of the windows before this one is
+    // done. Only items that started and are not parked count: those not started yet pass this
+    // gate themselves, and counting each other would make two new items wait for each other.
+    const others = runItems(this.state).filter(
+      (other) =>
+        other !== item &&
+        other.startedAt !== undefined &&
+        other.stopped === undefined &&
+        !this.awaitingAnswer(other),
+    );
+    const decision = decideStart({
+      estimate,
+      limits: this.usageLimits(),
+      tally: this.state.usage?.tally ?? {},
+      windows,
+      ranges: schedule.active_hours,
+      now,
+      ...(others.length === 0 ? {} : { inProgress: others.map((o) => o.usagePoints ?? {}) }),
+    });
+    this.log(item, `forecast: ${decision.reason}`);
+    await this.event({
+      type: "forecast",
+      item: item.index,
+      start: decision.start,
+      reason: decision.reason,
+    });
+    if (decision.start) return undefined;
+
+    let stopped: Exit | undefined;
+    if (decision.kind === "usage") {
+      const label = WINDOW_LABEL[decision.window];
+      const resetsAt = decision.until === undefined ? Number.NaN : Date.parse(decision.until);
+      const until = Math.max(
+        Number.isNaN(resetsAt) ? 0 : resetsAt + USAGE_RESET_GRACE_MS,
+        now.getTime() + usage.check_seconds * 1000,
+      );
+      if (usage.on_limit === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before the ${label} window resets ${formatTime(decision.until, now)}`,
+          "forecast_usage",
+          new Date(until),
+        );
+      }
+      stopped = await this.sleepUntil(
+        until,
+        `forecast: ${decision.reason}`,
+        `for the ${label} window to reset before starting a new item`,
+        "forecast_wait",
+        lane,
+      );
+    } else {
+      if (schedule.outside_hours === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before active hours start again ${formatTime(decision.until.toISOString(), now)}`,
+          "forecast_hours",
+          decision.until,
+        );
+      }
+      stopped = await this.sleepUntil(
+        decision.until.getTime(),
+        `forecast: ${decision.reason}`,
+        "for the next active hours before starting a new item",
+        "forecast_wait",
+        lane,
+      );
+    }
+    return stopped ?? "waited";
   }
 
   /**
    * Before Claude work: outside the configured active hours, waits for the next start (or pauses,
    * with outside_hours = "halt"). A step already running is never cut by the schedule.
    */
-  private async scheduleGate(): Promise<Exit | undefined> {
+  private async scheduleGate(lane: ItemState | undefined): Promise<Exit | undefined> {
     const { active_hours: ranges, outside_hours } = this.deps.config.schedule;
     if (ranges.length === 0) return undefined;
     const now = this.deps.host.now();
@@ -1252,17 +2020,29 @@ export class Pipeline {
     if (outside_hours === "halt") {
       return this.pause(
         `outside active hours (${hours}); they start again ${formatTime(start.toISOString(), now)}`,
+        "outside_hours",
+        start,
       );
     }
-    return this.sleepUntil(start.getTime(), `outside active hours (${hours})`, "", "schedule_wait");
+    return this.sleepUntil(
+      start.getTime(),
+      `outside active hours (${hours})`,
+      "",
+      "schedule_wait",
+      lane,
+    );
   }
 
-  /** Logs, records and performs a wait; returns an exit if a stop was requested meanwhile. */
+  /**
+   * Logs, records and performs a wait; returns an exit if a stop was requested meanwhile. The wait
+   * counts against `lane`'s active time.
+   */
   private async sleepUntil(
     until: number,
     reason: string,
     purpose: string,
     eventType: string,
+    lane?: ItemState,
   ): Promise<Exit | undefined> {
     const untilIso = new Date(until).toISOString();
     this.deps.host.log(
@@ -1272,10 +2052,16 @@ export class Pipeline {
     this.sleepers += 1;
     await this.save();
     await this.event({ type: eventType, reason, until: untilIso });
+    const started = this.deps.host.now().getTime();
     try {
       return await this.waitUntil(until);
     } finally {
+      if (lane !== undefined) {
+        const waited = Math.max(0, this.deps.host.now().getTime() - started);
+        this.waitedMs.set(lane.index, this.waited(lane) + waited);
+      }
       this.sleepers -= 1;
+      // Lanes share `state.waiting`: it goes once nobody waits.
       if (this.sleepers === 0) delete this.state.waiting;
       await this.save();
     }
@@ -1415,8 +2201,9 @@ export class Pipeline {
   }
 
   /**
-   * Live progress of a Claude step: every tool call is logged, and `status` sees the step, its
-   * tool count and the latest call (state is saved at most every PROGRESS_SAVE_MS while it runs).
+   * Live progress of a Claude step: every tool call is logged and appended to the run's progress
+   * feed (for `watch`), and `status` sees the step, its tool count and the latest call (state is
+   * saved at most every PROGRESS_SAVE_MS while it runs).
    */
   private trackActivity(
     item: ItemState,
@@ -1434,6 +2221,16 @@ export class Pipeline {
         activity.last = detail === "" ? name : `${name} ${detail}`;
         activity.lastAt = now().toISOString();
         this.log(item, `${template} · ${activity.last}`);
+        // The feed is only for `nightshift watch`; failing to write it must not fail the step.
+        this.deps.store
+          .progress(this.state.runId, {
+            at: activity.lastAt,
+            item: item.index,
+            step: template,
+            tool: name,
+            detail,
+          })
+          .catch(() => {});
         if (now().getTime() - lastSave >= PROGRESS_SAVE_MS) {
           lastSave = now().getTime();
           this.save().catch(() => {});
@@ -1500,13 +2297,28 @@ export class Pipeline {
       pr: item.pr?.url,
       mergeSha: item.mergeSha,
       costUsd: item.costUsd,
+      // For forecasts: what the item used of each window (when usage is measured), and its time.
+      ...(limitsEnabled(this.usageLimits())
+        ? {
+            usagePoints: Object.fromEntries(
+              USAGE_WINDOWS.map((w) => [w, item.usagePoints?.[w] ?? 0]),
+            ),
+          }
+        : {}),
+      activeMs: this.activeMs(item),
     });
-    await this.removeItem(item);
   }
 
-  /** Takes an item that ended off the list, and removes the worktree it had. */
+  /** Takes an item that ended off the list; with lanes, also removes the worktree it had. */
   private async removeItem(item: ItemState): Promise<void> {
-    this.state.items = this.state.items.filter((other) => other !== item);
+    if (!this.parallel) {
+      if (this.state.item === item) delete this.state.item;
+      return;
+    }
+    setRunItems(
+      this.state,
+      runItems(this.state).filter((other) => other !== item),
+    );
     this.mergesSeen.delete(item.index);
     await this.save();
     const worktree = item.worktree;
@@ -1543,6 +2355,14 @@ export class Pipeline {
     }
   }
 
+  /** A STOP file (or, with lanes, a stop another lane hit) ends the run at the next step. */
+  private async stopRequest(): Promise<Exit | undefined> {
+    if (this.runStop !== undefined) return this.runStop.exit;
+    if (!this.deps.host.stopRequested()) return undefined;
+    this.deps.host.clearStop();
+    return this.pause("stop requested (STOP file)", "stop_requested");
+  }
+
   private async diskExit(): Promise<Exit | undefined> {
     const min = this.deps.config.limits.min_free_disk_gb;
     if (min <= 0) return undefined;
@@ -1554,36 +2374,117 @@ export class Pipeline {
     );
   }
 
-  /** A STOP file (or, with lanes, a stop another lane hit) ends the run at the next step. */
-  private async stopRequest(): Promise<Exit | undefined> {
-    if (this.runStop !== undefined) return this.runStop;
-    if (!this.deps.host.stopRequested()) return undefined;
-    this.deps.host.clearStop();
-    return this.pause("stop requested (STOP file)");
-  }
-
-  private blocked(item: ItemState, question: string): Promise<Exit> {
+  private async blocked(item: ItemState, question: string): Promise<Exit> {
     item.pendingQuestion = question;
-    return this.stopLane(item, `needs a human: ${question}`, "blocked");
+    delete item.questionPost;
+    if (this.deps.config.answers.via === "github") await this.askOnGitHub(item, question);
+    return this.stopLane(item, `needs a human: ${question}`, "blocked", "question");
   }
 
-  private pause(reason: string): Promise<Exit> {
-    return this.halt(reason, "paused");
+  // ── answers on GitHub ───────────────────────────────────────────────────
+
+  /** Posts the open question on the item's PR (or a new issue). A failure is logged, not fatal. */
+  private async askOnGitHub(item: ItemState, question: string): Promise<void> {
+    const { forge, config } = this.deps;
+    try {
+      item.questionPost = await postQuestion(forge, config, this.state.runId, item, question, () =>
+        forge.repoSlug(this.repoPath(item)),
+      );
+    } catch (error) {
+      this.log(item, `could not post the question on GitHub: ${(error as Error).message}`);
+      await this.event({
+        type: "question_post_failed",
+        item: item.index,
+        error: (error as Error).message,
+      });
+      return;
+    }
+    this.log(item, `asked on GitHub: ${item.questionPost.url}`);
+    await this.event({
+      type: "question_posted",
+      item: item.index,
+      kind: item.questionPost.kind,
+      url: item.questionPost.url,
+    });
+  }
+
+  /**
+   * With `[answers] via = "github"`, looks for a reply to the open question and makes it the
+   * pending answer. Posts the question first if that failed when the run stopped. Returns whether
+   * an answer was found.
+   */
+  private async answerFromGitHub(item: ItemState): Promise<boolean> {
+    const { forge, config } = this.deps;
+    if (config.answers.via !== "github" || item.pendingQuestion === undefined) return false;
+    const post = item.questionPost;
+    if (post === undefined) {
+      await this.askOnGitHub(item, item.pendingQuestion);
+      return false;
+    }
+    let answer: Awaited<ReturnType<typeof findAnswer>>;
+    try {
+      answer = await findAnswer(forge, post, await allowedUsers(config, forge));
+    } catch (error) {
+      throw new Error(
+        `could not read the answer to the open question on GitHub (${post.url}): ${(error as Error).message}`,
+      );
+    }
+    if (answer === undefined) return false;
+    item.pendingAnswer = answer.text;
+    this.log(item, `answer from @${answer.by.join(", @")} on GitHub: ${post.url}`);
+    await this.save();
+    await this.event({
+      type: "answer",
+      item: item.index,
+      source: "github",
+      by: answer.by.join(", "),
+      url: answer.comments[0]?.url,
+    });
+    for (const problem of await acknowledge(forge, post, answer)) this.log(item, problem);
+    delete item.questionPost; // answered and acknowledged; the answer is kept until a step succeeds
+    await this.save();
+    return true;
+  }
+
+  /** An answer given with `--answer` closes the question asked on GitHub. */
+  private async answeredLocally(item: ItemState): Promise<void> {
+    const post = item.questionPost;
+    if (post === undefined) return;
+    await this.event({ type: "answer", item: item.index, source: "terminal" });
+    for (const problem of await acknowledge(this.deps.forge, post, undefined)) {
+      this.log(item, problem);
+    }
+    delete item.questionPost;
+  }
+
+  private pause(reason: string, cause: StopCause, resumeAt?: Date): Promise<Exit> {
+    return this.halt(reason, "paused", cause, resumeAt);
   }
 
   /**
    * Stops the run. With one lane it ends at once; with several, every lane stops at its next step
    * (a running step finishes) and the run ends when the last one has.
    */
-  private async halt(reason: string, kind: "halted" | "blocked" | "paused"): Promise<Exit> {
-    if (!this.parallel) return this.conclude(kind, reason);
-    const exit: Exit = { kind, reason, state: this.state };
-    if (this.runStop === undefined || SEVERITY[kind] > SEVERITY[this.runStop.kind]) {
-      this.runStop = exit;
-      this.deps.host.log(`stopping all lanes (${kind}): ${reason}`);
-      await this.event({ type: "run_stop", kind, reason });
+  private async halt(
+    reason: string,
+    kind: "halted" | "blocked" | "paused",
+    cause: StopCause = kind === "blocked" ? "question" : "failure",
+    resumeAt?: Date,
+  ): Promise<Exit> {
+    if (this.parallel) {
+      const exit = { kind, reason, state: this.state };
+      if (this.runStop === undefined || SEVERITY[kind] > SEVERITY[this.runStop.exit.kind]) {
+        this.runStop = { exit, cause, resumeAt };
+        this.deps.host.log(`stopping all lanes (${kind}): ${reason}`);
+        await this.event({ type: "run_stop", kind, reason, cause });
+      }
+      return exit;
     }
-    return exit;
+    // A planned pause or Ctrl-C is no news for the issue; everything else needs a human.
+    if (kind !== "paused" && !this.signal.aborted) {
+      await this.noteIssue(this.state.item, reason, kind);
+    }
+    return this.conclude(reason, kind, cause, resumeAt);
   }
 
   /**
@@ -1593,47 +2494,90 @@ export class Pipeline {
   private async stopLane(
     item: ItemState,
     reason: string,
-    kind: "halted" | "blocked" | "paused",
+    kind: "halted" | "blocked",
+    cause: StopCause = kind === "blocked" ? "question" : "failure",
   ): Promise<Exit> {
-    if (!this.parallel) return this.halt(reason, kind);
-    item.stopped = { kind, reason };
+    if (!this.parallel) return this.halt(reason, kind, cause);
+    item.stopped = { kind, reason, cause };
     if (!this.draining) {
       this.draining = true;
       this.deps.host.log(
         "a lane stopped: the other lanes finish their current item, then the run stops",
       );
     }
+    if (!this.signal.aborted) await this.noteIssue(item, reason, kind);
     await this.save();
-    await this.event({ type: "lane_stop", kind, reason, item: item.index, phase: item.phase });
+    await this.event({
+      type: "lane_stop",
+      kind,
+      reason,
+      cause,
+      item: item.index,
+      phase: item.phase,
+    });
     this.log(item, `${kind}: ${reason}`);
     return { kind, reason, state: this.state };
   }
 
-  /** Ends the invocation: records why, and notifies. */
-  private async conclude(kind: "halted" | "blocked" | "paused", reason: string): Promise<Exit> {
+  /** Ends the invocation: records why, writes the report and notifies. */
+  private async conclude(
+    reason: string,
+    kind: "halted" | "blocked" | "paused",
+    cause: StopCause,
+    resumeAt?: Date,
+  ): Promise<Exit> {
     this.state.status = "halted";
     this.state.haltReason = reason;
+    this.state.stop = {
+      kind,
+      cause,
+      at: this.deps.host.now().toISOString(),
+      ...(resumeAt === undefined ? {} : { resumeAt: resumeAt.toISOString() }),
+    };
     await this.save();
+    await this.closePhase();
     const item = this.focus();
-    await this.event({ type: kind, reason, item: item?.index, phase: item?.phase });
+    await this.event({
+      type: kind,
+      reason,
+      cause,
+      item: item?.index,
+      phase: item?.phase,
+    });
     this.deps.host.log(`${kind}: ${reason}`);
-    await this.deps.host.notify("halted", this.notifyFields(kind, reason));
+    const report = await this.report();
+    await this.deps.host.notify("halted", this.notifyFields(kind, reason, report));
     return { kind, reason, state: this.state };
   }
 
   private async finish(reason: string): Promise<Exit> {
     this.state.status = "done";
     this.state.haltReason = reason;
+    this.state.stop = { kind: "done", cause: "done", at: this.deps.host.now().toISOString() };
     await this.save();
+    await this.closePhase();
     await this.event({ type: "done", reason, itemsCompleted: this.state.itemsCompleted });
     this.deps.host.log(`done: ${reason}`);
-    await this.deps.host.notify("done", this.notifyFields("done", reason));
+    const report = await this.report();
+    await this.deps.host.notify("done", this.notifyFields("done", reason, report));
     return { kind: "done", reason, state: this.state };
+  }
+
+  /** Writes the morning report; returns its path, or "" when it could not be written. */
+  private async report(): Promise<string> {
+    try {
+      const file = await writeReport(this.deps.store, this.state, this.deps.host.now());
+      this.deps.host.log(`report: ${file}`);
+      return file;
+    } catch (error) {
+      this.deps.host.log(`could not write the report: ${(error as Error).message}`);
+      return "";
+    }
   }
 
   /** The item an exit is mostly about: the first that stopped or waits for a human. */
   private focus(): ItemState | undefined {
-    const items = this.state.items;
+    const items = runItems(this.state);
     return (
       items.find((i) => i.stopped !== undefined) ??
       items.find((i) => i.pendingQuestion !== undefined) ??
@@ -1641,7 +2585,7 @@ export class Pipeline {
     );
   }
 
-  private notifyFields(kind: string, reason: string): Record<string, string> {
+  private notifyFields(kind: string, reason: string, report: string): Record<string, string> {
     const item = this.focus();
     return {
       kind,
@@ -1650,6 +2594,8 @@ export class Pipeline {
       item: item ? (item.label ?? String(item.index)) : "",
       pr: item?.pr?.url ?? "",
       cost: this.state.costUsd.toFixed(2),
+      question_url: item?.questionPost?.url ?? "",
+      report,
     };
   }
 
@@ -1663,15 +2609,11 @@ export class Pipeline {
     return { pr_number: pr.number, pr_url: pr.url, repo_slug: pr.repoSlug, branch: pr.branch };
   }
 
-  private repoList(): string {
-    return Object.entries(this.deps.config.repos)
-      .map(([alias, dir]) => `- ${alias}: ${dir}`)
-      .join("\n");
-  }
-
   /** One line about an item in progress, for the prompt that picks items to run alongside it. */
   private describe(item: ItemState): string {
-    const handoff = item.handoff.replace(/\s+/g, " ").trim();
+    const handoff = (item.issue === undefined ? item.handoff : item.issue.title)
+      .replace(/\s+/g, " ")
+      .trim();
     const brief = handoff.length > 300 ? `${handoff.slice(0, 300)}…` : handoff;
     const status =
       item.pendingQuestion !== undefined
@@ -1692,8 +2634,12 @@ export class Pipeline {
   }
 
   private repoPath(item: ItemState): string {
-    const dir = this.deps.config.repos[item.repo];
-    if (dir === undefined) throw new Error(`unknown repo alias "${item.repo}"`);
+    return this.repoDir(item.repo);
+  }
+
+  private repoDir(alias: string): string {
+    const dir = this.deps.config.repos[alias];
+    if (dir === undefined) throw new Error(`unknown repo alias "${alias}"`);
     return dir;
   }
 
