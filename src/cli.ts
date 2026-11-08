@@ -24,6 +24,7 @@ import {
   type UsageWindow,
   usageLimits,
 } from "./usage.js";
+import { watch } from "./watch.js";
 
 const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -42,6 +43,8 @@ Usage:
   nightshift resume [--answer TEXT] [--once] [--max-items N] [--usage-share PCT]
                                              continue a halted or paused run
   nightshift status [--json]                 show the current run
+  nightshift watch [--once]                  follow the current run live (q quits; --once prints
+                                             one frame)
   nightshift stop                            stop gracefully after the current step
 
 Options:
@@ -57,7 +60,7 @@ Options:
 Exit codes: 0 done or paused · 1 error · 2 blocked on a question · 3 halted · 130 interrupted
 Docs: https://github.com/ya-nsh/nightshift`;
 
-const COMMANDS = new Set(["init", "doctor", "run", "resume", "status", "stop"]);
+const COMMANDS = new Set(["init", "doctor", "run", "resume", "status", "watch", "stop"]);
 const EXIT_CODES: Record<Exit["kind"], number> = { done: 0, paused: 0, blocked: 2, halted: 3 };
 
 async function main(argv: string[]): Promise<number> {
@@ -120,6 +123,8 @@ async function main(argv: string[]): Promise<number> {
     }
     case "status":
       return status(await store.load(), values.json, config);
+    case "watch":
+      return watch({ dir: config.dir, usage: config.usage, once: values.once });
     case "stop":
       await writeFile(path.join(config.dir, STOP_FILE), `${new Date().toISOString()}\n`);
       console.log("nightshift will stop after the current step");

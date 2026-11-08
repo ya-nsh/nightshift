@@ -118,6 +118,17 @@ back, and a checks timeout starts over.
 While a step runs, nightshift logs each tool call Claude makes (`[T12] implement · Bash npm test`).
 `nightshift status` shows where the run is: the running step, for how long, its tool calls and the
 latest one, any wait, cost and usage, and whether the nightshift process is still alive.
+
+`nightshift watch` follows a run live from any terminal, whoever drives it (another terminal, a
+background service): the run's status and whether its process is alive, the current item, phase
+and PR, the running step with its elapsed time and a scrolling list of its latest tool calls, cost,
+5-hour and weekly usage bars (█ nightshift's points, ▓ the rest of the account, │ the `*_max`
+limit) with the reset times, any wait and when it ends, and the last ten events. It only reads
+files, so it never disturbs the run; it redraws about once a second and follows the next run when
+one starts. `q` or Ctrl-C quits and restores the terminal. Lines are cut to the terminal width,
+`NO_COLOR` turns colours off, and when the output is not a terminal (a pipe, a log file) it prints
+new events, tool calls and status changes line by line, like `tail -f`. `nightshift watch --once`
+prints one frame and exits.
 `nightshift stop` finishes the current step and stops. Configure `[notify] command` to get pinged
 on every stop (ntfy, `terminal-notifier`, Slack webhook…).
 
@@ -311,6 +322,8 @@ colleague push access for the night.
 ├── STOP                 # created by `nightshift stop`
 └── runs/<run-id>/
     ├── events.jsonl     # every transition, cost, usage and outcome
+    ├── progress.jsonl   # every tool call of every step, for `watch` (rotates at 256 KiB
+    │                    # to progress.1.jsonl, so at most about 512 KiB)
     └── item-<n>/        # each Claude step's streamed messages (.jsonl) and review log
 ```
 

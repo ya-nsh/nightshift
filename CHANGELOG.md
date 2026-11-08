@@ -8,6 +8,14 @@
   step, falling back to `[agent]`; e.g. `implement` on opus, `address` and `fix_checks` on sonnet.
   Unknown steps and bad values are config errors. Both backends apply them, `nightshift doctor`
   lists each step's model, step log lines name the model, and `agent` events record it.
+- **`nightshift watch`.** A live terminal view of a run driven elsewhere (another terminal, a
+  background service): run status and whether its process is alive, the current item, phase and
+  PR, the running step with elapsed time, tool count and its latest tool calls, cost, 5-hour and
+  weekly usage bars with nightshift's share and reset times, any wait, and the last ten events.
+  It only reads `.nightshift/`, cuts lines to the terminal width, respects `NO_COLOR`, prints
+  line by line when the output is not a terminal, and quits on `q` / Ctrl-C. `--once` prints one
+  frame. Each tool call is now also appended to `.nightshift/runs/<run-id>/progress.jsonl`
+  (rotated at 256 KiB, one older file kept).
 
 ## 0.3.0 — 2026-11-08
 

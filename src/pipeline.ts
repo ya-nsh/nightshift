@@ -1025,8 +1025,9 @@ export class Pipeline {
   }
 
   /**
-   * Live progress of a Claude step: every tool call is logged, and `status` sees the step, its
-   * tool count and the latest call (state is saved at most every PROGRESS_SAVE_MS while it runs).
+   * Live progress of a Claude step: every tool call is logged and appended to the run's progress
+   * feed (for `watch`), and `status` sees the step, its tool count and the latest call (state is
+   * saved at most every PROGRESS_SAVE_MS while it runs).
    */
   private trackActivity(
     item: ItemState,
@@ -1044,6 +1045,16 @@ export class Pipeline {
         activity.last = detail === "" ? name : `${name} ${detail}`;
         activity.lastAt = now().toISOString();
         this.log(item, `${template} · ${activity.last}`);
+        // The feed is only for `nightshift watch`; failing to write it must not fail the step.
+        this.deps.store
+          .progress(this.state.runId, {
+            at: activity.lastAt,
+            item: item.index,
+            step: template,
+            tool: name,
+            detail,
+          })
+          .catch(() => {});
         if (now().getTime() - lastSave >= PROGRESS_SAVE_MS) {
           lastSave = now().getTime();
           this.save().catch(() => {});
