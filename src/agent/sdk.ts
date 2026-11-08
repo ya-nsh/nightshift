@@ -105,19 +105,19 @@ export function buildSdkOptions(
 ): Record<string, unknown> {
   const extraArgs = toSdkExtraArgs(config.extra_args);
   const executable = resolveClaudePath(config.claude_path);
+  const permissionMode = request.permissionMode ?? config.permission_mode;
+  const model = request.model ?? config.model;
   return {
     cwd: request.cwd,
-    permissionMode: config.permission_mode,
-    ...(config.permission_mode === "bypassPermissions"
-      ? { allowDangerouslySkipPermissions: true }
-      : {}),
-    maxTurns: config.max_turns,
+    permissionMode,
+    ...(permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
+    maxTurns: request.maxTurns ?? config.max_turns,
     maxBudgetUsd: request.maxBudgetUsd,
     outputFormat: { type: "json_schema", schema: request.schema },
     // Load the same settings, CLAUDE.md files and skills as the CLI does.
     settingSources: ["user", "project", "local"],
     abortController,
-    ...(config.model === undefined ? {} : { model: config.model }),
+    ...(model === undefined ? {} : { model }),
     ...(request.resumeSessionId === undefined ? {} : { resume: request.resumeSessionId }),
     ...(config.allowed_tools.length > 0 ? { allowedTools: config.allowed_tools } : {}),
     ...(config.add_dirs.length > 0 ? { additionalDirectories: config.add_dirs } : {}),

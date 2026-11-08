@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Models per step.** `[agent.steps.<step>]` (`implement`, `address`, `fix_checks`,
+  `resolve_conflicts`, `finalize`) overrides `model`, `max_turns` and `permission_mode` for that
+  step, falling back to `[agent]`; e.g. `implement` on opus, `address` and `fix_checks` on sonnet.
+  Unknown steps and bad values are config errors. Both backends apply them, `nightshift doctor`
+  lists each step's model, step log lines name the model, and `agent` events record it.
+
 ## 0.3.0 — 2026-11-08
 
 ### Added
