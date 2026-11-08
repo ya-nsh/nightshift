@@ -9,6 +9,8 @@ import type {
   CheckSummary,
   Forge,
   Host,
+  Issue,
+  IssueEdit,
   PullRequest,
   Reviewer,
   ReviewRequest,
@@ -130,11 +132,106 @@ export class FakeForge implements Forge {
     }
     this.merges.push({ number, method, headSha });
     fake.pr = { ...fake.pr, state: "MERGED", mergeCommitSha: `merge-${number}` };
+    const closes = this.closesOnMerge.get(number);
+    const issue = closes === undefined ? undefined : this.issues.get(closes);
+    if (issue !== undefined) issue.state = "CLOSED";
     return Promise.resolve();
   }
 
   deleteBranch(_slug: string, branch: string): Promise<void> {
     this.deletedBranches.push(branch);
+    return Promise.resolve();
+  }
+
+  // ── issues ──
+
+  readonly issues = new Map<number, Issue>();
+  readonly comments: Array<{ number: number; body: string }> = [];
+  readonly closed: Array<{ number: number; comment: string }> = [];
+  readonly edits: Array<{ number: number; edit: IssueEdit }> = [];
+  readonly labelsCreated: string[] = [];
+  user = "night-bot";
+  /** Runs after every edit, e.g. to simulate another process claiming the same issue. */
+  afterEdit: ((issue: Issue) => void) | undefined;
+  /** When set, issue writes (edit, comment, close, label) fail with it. */
+  issueWriteError: Error | undefined;
+  /** Merging a PR closes these issues, like GitHub does for `Closes #N`. */
+  readonly closesOnMerge = new Map<number, number>();
+
+  addIssue(number: number, overrides: Partial<Issue> = {}): Issue {
+    const issue: Issue = {
+      number,
+      title: `Issue ${number}`,
+      body: `Body of issue ${number}`,
+      url: `https://github.com/acme/app/issues/${number}`,
+      state: "OPEN",
+      labels: ["nightshift"],
+      assignees: [],
+      author: "alice",
+      createdAt: new Date(Date.UTC(2026, 0, number)).toISOString(),
+      ...overrides,
+    };
+    this.issues.set(number, issue);
+    return issue;
+  }
+
+  currentUser(): Promise<string> {
+    return Promise.resolve(this.user);
+  }
+
+  listIssues(_slug: string, label: string): Promise<Issue[]> {
+    return Promise.resolve(
+      [...this.issues.values()]
+        .filter((i) => i.state === "OPEN" && i.labels.includes(label))
+        .map((i) => ({ ...i, body: "" })),
+    );
+  }
+
+  issue(_slug: string, number: number): Promise<Issue> {
+    const issue = this.issues.get(number);
+    if (issue === undefined) return Promise.reject(new Error(`no issue #${number}`));
+    return Promise.resolve({
+      ...issue,
+      labels: [...issue.labels],
+      assignees: [...issue.assignees],
+    });
+  }
+
+  editIssue(_slug: string, number: number, edit: IssueEdit): Promise<void> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    const issue = this.issues.get(number);
+    if (issue === undefined) return Promise.reject(new Error(`no issue #${number}`));
+    this.edits.push({ number, edit });
+    const without = (list: string[], remove: string[] = []) =>
+      list.filter((x) => !remove.includes(x));
+    const union = (list: string[], add: string[] = []) => [
+      ...list,
+      ...add.filter((x) => !list.includes(x)),
+    ];
+    issue.labels = union(without(issue.labels, edit.removeLabels), edit.addLabels);
+    issue.assignees = union(without(issue.assignees, edit.removeAssignees), edit.addAssignees);
+    this.afterEdit?.(issue);
+    return Promise.resolve();
+  }
+
+  commentIssue(_slug: string, number: number, body: string): Promise<void> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    this.comments.push({ number, body });
+    return Promise.resolve();
+  }
+
+  closeIssue(_slug: string, number: number, comment: string): Promise<void> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    const issue = this.issues.get(number);
+    if (issue === undefined) return Promise.reject(new Error(`no issue #${number}`));
+    issue.state = "CLOSED";
+    this.closed.push({ number, comment });
+    return Promise.resolve();
+  }
+
+  ensureLabel(_slug: string, name: string): Promise<void> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    if (!this.labelsCreated.includes(name)) this.labelsCreated.push(name);
     return Promise.resolve();
   }
 }

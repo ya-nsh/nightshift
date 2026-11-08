@@ -108,6 +108,40 @@ export interface Forge {
     options?: { auto?: boolean },
   ): Promise<void>;
   deleteBranch(repoSlug: string, branch: string): Promise<void>;
+
+  // ── issues (the `github_issues` task source) ──
+  /** Login of the account the forge acts as. */
+  currentUser(): Promise<string>;
+  /** Open issues carrying `label`; `body` may be empty here, `issue()` has it. */
+  listIssues(repoSlug: string, label: string): Promise<Issue[]>;
+  issue(repoSlug: string, number: number): Promise<Issue>;
+  editIssue(repoSlug: string, number: number, edit: IssueEdit): Promise<void>;
+  commentIssue(repoSlug: string, number: number, body: string): Promise<void>;
+  /** Closes the issue as completed, with a comment. */
+  closeIssue(repoSlug: string, number: number, comment: string): Promise<void>;
+  /** Creates the label if the repository does not have it yet. */
+  ensureLabel(repoSlug: string, name: string, color: string, description: string): Promise<void>;
+}
+
+export type IssueState = "OPEN" | "CLOSED";
+
+export interface Issue {
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+  state: IssueState;
+  labels: string[];
+  assignees: string[];
+  author: string;
+  createdAt: string;
+}
+
+export interface IssueEdit {
+  addLabels?: string[];
+  removeLabels?: string[];
+  addAssignees?: string[];
+  removeAssignees?: string[];
 }
 
 export interface ReviewRequest {

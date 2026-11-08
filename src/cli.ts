@@ -10,7 +10,8 @@ import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { GhForge } from "./github.js";
 import { NodeHost, STOP_FILE } from "./host.js";
 import { init } from "./init.js";
-import { type Exit, newRunState, Pipeline } from "./pipeline.js";
+import { describeQueue, quote, releaseClaim } from "./issues.js";
+import { type Exit, newIssuesRunState, newRunState, Pipeline } from "./pipeline.js";
 import { formatPlan, makePlan, PlanError, parsePlanCount, writePlan } from "./plan.js";
 import type { Agent } from "./ports.js";
 import { preflight } from "./preflight.js";
@@ -41,7 +42,9 @@ Usage:
   nightshift doctor                          check gh, claude, repos, review command, disk
   nightshift run (--prompt TEXT | --prompt-file FILE) [--repo ALIAS] [--once] [--max-items N]
                  [--usage-share PCT] [--force]
-                                             start a run with the first item's prompt
+                                             start a run with the first item's prompt (with
+                                             [tasks] source = "github_issues" the prompt is
+                                             optional: extra instructions for every issue)
   nightshift resume [--answer TEXT] [--once] [--max-items N] [--usage-share PCT]
                                              continue a halted or paused run
   nightshift plan [-n N] [--prompt TEXT | --prompt-file FILE] [--repo ALIAS] [--json] [--write]
@@ -156,8 +159,17 @@ async function main(argv: string[]): Promise<number> {
       console.log("nightshift will stop after the current step");
       return 0;
     case "run": {
+      const fromIssues = config.tasks.source === "github_issues";
       const prompt = await readPrompt(values.prompt, values["prompt-file"], cwd);
-      const repo = values.repo ?? config.defaultRepo;
+      if (prompt === undefined && !fromIssues) {
+        throw new UsageError("give exactly one of --prompt or --prompt-file");
+      }
+      if (fromIssues && values.repo !== undefined && values.repo !== config.tasks.repo) {
+        throw new UsageError(
+          `issues come from [tasks] repo = "${config.tasks.repo}"; --repo cannot change that`,
+        );
+      }
+      const repo = values.repo ?? (fromIssues ? config.tasks.repo : config.defaultRepo);
       if (config.repos[repo] === undefined) {
         throw new UsageError(
           `unknown repo "${repo}"; configured: ${Object.keys(config.repos).join(", ")}`,
@@ -173,9 +185,16 @@ async function main(argv: string[]): Promise<number> {
           }
         }
         if (!(await doctor(config, usageShare, undefined))) return 1;
-        if (existing) await store.archive(existing);
+        if (existing) {
+          if (existing.status !== "done") await releaseAbandonedIssue(existing);
+          await store.archive(existing);
+        }
         const now = new Date();
-        const state = newRunState(newRunId(now), now, repo, prompt);
+        const runId = newRunId(now);
+        const state =
+          fromIssues || prompt === undefined
+            ? newIssuesRunState(runId, now, prompt)
+            : newRunState(runId, now, repo, prompt);
         if (usageShare !== undefined) state.usageShare = usageShare;
         await store.save(state);
         return drive(config, store, state, maxItems, undefined);
@@ -253,6 +272,26 @@ async function drive(
   } finally {
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
+  }
+}
+
+/** `run --force` abandons a run: the issue it was working on is free for the next run again. */
+async function releaseAbandonedIssue(state: RunState): Promise<void> {
+  const issue = state.item?.issue;
+  if (issue === undefined) return;
+  const forge = new GhForge();
+  try {
+    await forge.commentIssue(
+      issue.repoSlug,
+      issue.number,
+      `**nightshift** abandoned run \`${state.runId}\`, which was working on this issue${state.haltReason ? `:\n\n${quote(state.haltReason)}` : "."}\n\nThe issue is no longer claimed.`,
+    );
+    await releaseClaim(forge, issue);
+    console.error(`released issue #${issue.number} (${issue.url})`);
+  } catch (error) {
+    console.error(
+      `could not release issue #${issue.number} (${issue.url}): ${(error as Error).message}; remove its in-progress label and assignee yourself`,
+    );
   }
 }
 
@@ -350,8 +389,9 @@ async function status(state: RunState | undefined, json: boolean, config: Config
     console.log(JSON.stringify(state ?? null, null, 2));
     return 0;
   }
+  const tasks = await describeTasks(config);
   if (state === undefined) {
-    console.log("no run yet");
+    console.log(`no run yet\n${tasks}`);
     return 0;
   }
   const now = new Date();
@@ -371,6 +411,7 @@ async function status(state: RunState | undefined, json: boolean, config: Config
     lines.push(
       `item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}${formatPoints(item.usagePoints)}`,
     );
+    if (item.issue) lines.push(`issue ${item.issue.url} — ${item.issue.title}`);
     if (item.pr) lines.push(`PR ${item.pr.url}`);
     const activity = item.activity;
     if (activity && holder !== undefined) {
@@ -387,6 +428,7 @@ async function status(state: RunState | undefined, json: boolean, config: Config
   if (state.waiting !== undefined && holder !== undefined) {
     lines.push(`waiting until ${formatTime(state.waiting.until, now)}: ${state.waiting.reason}`);
   }
+  lines.push(tasks);
   const limits = usageLimits(config.usage, state.usageShare);
   const usage = state.usage;
   if (usage?.last !== undefined) {
@@ -409,6 +451,15 @@ async function status(state: RunState | undefined, json: boolean, config: Config
   return 0;
 }
 
+/** The task source and, for GitHub issues, the queue and the next issue. */
+async function describeTasks(config: Config): Promise<string> {
+  if (config.tasks.source !== "github_issues") {
+    return "tasks: handoff (the finalize step writes the next prompt)";
+  }
+  const queue = await describeQueue(new GhForge(), config);
+  return `tasks: ${queue.detail}`;
+}
+
 function formatPoints(points: Partial<Record<UsageWindow, number>> | undefined): string {
   const five = points?.five_hour;
   return five === undefined || five <= 0 ? "" : ` · ${five} points of 5-hour usage`;
@@ -422,14 +473,16 @@ function ago(iso: string, now: Date): string {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
+/** The prompt from --prompt or --prompt-file; undefined when neither is given. */
 async function readPrompt(
   text: string | undefined,
   file: string | undefined,
   cwd: string,
-): Promise<string> {
-  if ((text === undefined) === (file === undefined)) {
-    throw new UsageError("give exactly one of --prompt or --prompt-file");
+): Promise<string | undefined> {
+  if (text !== undefined && file !== undefined) {
+    throw new UsageError("give only one of --prompt or --prompt-file");
   }
+  if (text === undefined && file === undefined) return undefined;
   const prompt = text ?? (await readFile(path.resolve(cwd, file as string), "utf8"));
   if (prompt.trim() === "") throw new UsageError("the prompt is empty");
   return prompt;

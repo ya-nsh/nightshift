@@ -66,6 +66,24 @@ export function finalizeResult(repoAliases: readonly [string, ...string[]]) {
 }
 export type FinalizeResult = z.infer<ReturnType<typeof finalizeResult>>;
 
+/**
+ * Finalize for an item that came from a GitHub issue: nightshift takes the next task from the
+ * issues, so there is no handoff to write.
+ */
+export const finalizeIssueResult = z.strictObject({
+  status: z
+    .enum(["continue", "blocked"])
+    .describe(
+      "continue: the post-merge steps are done. blocked: a human must act or decide before nightshift goes on.",
+    ),
+  summary: z.string().describe("One or two sentences on the post-merge steps you did."),
+  question: z
+    .string()
+    .optional()
+    .describe("Required when status is blocked: the precise question for the human."),
+});
+export type FinalizeIssueResult = z.infer<typeof finalizeIssueResult>;
+
 export const PLAN_SIZES = ["S", "M", "L", "XL"] as const;
 export const PLAN_RISKS = ["low", "medium", "high"] as const;
 

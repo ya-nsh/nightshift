@@ -5,6 +5,8 @@ import { loadSdkQuery, resolveClaudePath, toSdkExtraArgs } from "./agent/sdk.js"
 import { type Config, describeStepSettings, expandHome } from "./config.js";
 import { exec, shellQuote } from "./exec.js";
 import { describeForecast, estimateItem, readHistory } from "./forecast.js";
+import { GhForge } from "./github.js";
+import { describeQueue } from "./issues.js";
 import { isActive, nextStart } from "./schedule.js";
 import {
   ClaudeUsageMeter,
@@ -89,6 +91,17 @@ export async function preflight(
       slug?.ok ?? false,
       slug?.ok ? `${dir} → ${slug.out.trim()}` : `${dir}: ${slug?.out ?? "gh unavailable"}`,
     );
+  }
+
+  if (config.tasks.source === "github_issues") {
+    if (gh.ok) {
+      const queue = await describeQueue(new GhForge(), config);
+      add("tasks", queue.ok, queue.detail);
+    } else {
+      add("tasks", false, "GitHub issues need gh");
+    }
+  } else {
+    add("tasks", true, "handoff (the finalize step writes the next prompt)");
   }
 
   const command = config.review.command.trim();

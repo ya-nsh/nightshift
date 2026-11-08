@@ -67,6 +67,37 @@ export interface ItemState {
   autoMergeSha?: string;
   /** The bounded loop whose cap halted the run; `resume` grants that loop fresh rounds. */
   capHit?: "fix_checks" | "resolve_conflicts";
+  /** The GitHub issue this item works on (`[tasks] source = "github_issues"`). */
+  issue?: ItemIssue;
+}
+
+export interface ItemIssue {
+  number: number;
+  title: string;
+  url: string;
+  repoSlug: string;
+  /** Set once the claim (in-progress label and/or assignee) is in place. */
+  claimed?: boolean;
+  /** The in-progress label the claim uses; removed again when the claim is released. */
+  claimLabel?: string;
+  /** The assignee the claim added (not one a human had set); removed when the claim is released. */
+  assignee?: string;
+  /** The blocked label nightshift added when the item stopped; removed on `resume`. */
+  flagged?: string;
+  /** The stop reason last posted on the issue, so the same stop is not commented twice. */
+  noted?: string;
+  /** Finalize's post-merge work is done; what is left is making sure the issue is closed. */
+  finalized?: boolean;
+}
+
+/** Run-wide state of the `github_issues` task source. */
+export interface IssuesRunState {
+  /** `--prompt` given to `run`: extra instructions added to every issue's prompt. */
+  instructions?: string;
+  /** Index of the last item created from an issue. */
+  picked?: number;
+  /** Issues this run let go of without a PR (Claude found nothing to change); not picked again. */
+  skipped?: number[];
 }
 
 export interface RunState {
@@ -83,6 +114,8 @@ export interface RunState {
   usage?: UsageState;
   /** Set while the run sleeps: for a usage window to reset, or for its active hours. */
   waiting?: { until: string; reason: string };
+  /** Present when the run takes its tasks from GitHub issues. */
+  issues?: IssuesRunState;
 }
 
 export interface UsageState {

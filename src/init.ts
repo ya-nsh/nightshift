@@ -99,6 +99,22 @@ forecast_percentile = 50          # 50 = median item; higher is more cautious (5
 # active_hours = ["23:00-07:00"]
 outside_hours = "wait"            # "wait" for the next range, or "halt" (pause; resume later)
 
+[tasks]
+# Where the next task comes from:
+#   "handoff"        the finalize step picks it from the repo's own instructions and writes the
+#                    next prompt (the first one comes from \`nightshift run --prompt\`)
+#   "github_issues"  open GitHub issues carrying \`label\`, one per item; \`--prompt\` is optional
+#                    and adds instructions to every issue
+source = "handoff"
+label = "nightshift"              # only issues with this label are picked
+# repo = "${alias}"               # alias whose GitHub issues are the queue (default: default_repo)
+priority_labels = []              # e.g. ["p0", "p1"]: earlier labels first, then oldest first
+skip_labels = ["blocked"]         # never pick issues with any of these
+# authors = ["you"]               # only issues opened by these logins (issue text goes to Claude)
+assign = true                     # claim: assign the issue to the gh account
+in_progress_label = "nightshift-in-progress"   # claim label ("" = none); claimed issues are skipped
+blocked_label = "nightshift-blocked"           # added when nightshift stops on an issue ("" = none)
+
 [notify]
 # Runs on halt/finish with NIGHTSHIFT_EVENT, _KIND, _REASON, _ITEM, _PR, _COST, _RUN in the environment.
 command = ""

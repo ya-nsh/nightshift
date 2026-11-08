@@ -215,6 +215,22 @@ export function describeEvent(event: WatchEvent): { text: string; style?: Style 
     }
     case "auto_merge":
       return { text: `${item}auto-merge on: ${str(event.reason)}` };
+    case "issue_picked":
+      return { text: `${item}picked issue ${str(event.issue)}`, style: "cyan" };
+    case "issue_claimed":
+      return { text: `${item}claimed issue ${str(event.issue)}` };
+    case "issue_set_aside":
+      return {
+        text: `${item}no change needed; set issue ${str(event.issue)} aside: ${str(event.summary)}`,
+        style: "yellow",
+      };
+    case "issue_closed":
+      return {
+        text: `${item}issue ${str(event.issue)} closed${event.by === "nightshift" ? " by nightshift" : ""}`,
+        style: "green",
+      };
+    case "issue_update_failed":
+      return { text: `${item}could not ${str(event.what)}: ${str(event.error)}`, style: "yellow" };
     case "item_done":
       return { text: `${item}done${event.label ? ` — ${str(event.label)}` : ""}`, style: "green" };
     case "usage": {
