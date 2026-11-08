@@ -3,6 +3,27 @@
 ## Unreleased
 
 ### Added
+- **Answer from GitHub.** With `[answers] via = "github"`, a question is posted as a comment on the
+  item's PR; with no PR yet, on the item's own issue (GitHub issues source) or else in a new issue,
+  with a hidden marker and reply instructions.
+  A later comment from an allowed user (`[answers] users`, default: the `gh` login) is the answer:
+  `nightshift resume` with no `--answer` picks it up, reacts with 👍 and closes an issue it opened
+  for the question (never the item's own issue). Bots,
+  other users and nightshift's own comments are ignored; the reply is data for Claude, like `--answer`.
+- **Background service.** `nightshift service install|uninstall|status` runs the new
+  `nightshift daemon` as a launchd agent (macOS) or systemd user unit (Linux). It resumes a run when
+  an answer arrives on GitHub, when a usage-limit, active-hours or forecast pause clears, and after a
+  reboot, crash or SIGTERM; it leaves `nightshift stop`, the item limit, Ctrl-C and failures to you
+  (and a run with no task or issue left is done), respects the run's lock, backs off, and logs to
+  `.nightshift/daemon.log`.
+- **Morning report.** Every stop writes `.nightshift/runs/<run-id>/report.md` (copied to
+  `.nightshift/report.md`): items with PR, merged commit, Claude's summary, cost, usage points and
+  time per step (and active time), the GitHub issue an item came from, forecast decisions that held
+  an item back, plus what is blocked or failed and why. `nightshift report [--run ID]` prints it,
+  and the notify command gets its path as `NIGHTSHIFT_REPORT` (and `NIGHTSHIFT_QUESTION_URL`).
+- `state.json` records why the run stopped (`stop.cause`, and `stop.resumeAt` when it clears by
+  itself); SIGTERM is recorded as `terminated`, apart from Ctrl-C. Events gain `phase` (time per
+  phase) and `result` (each step's summary), shown by `nightshift watch`.
 - **GitHub issues as the task source.** `[tasks] source = "github_issues"` takes each item from the
   open issues labelled `[tasks] label` (default `nightshift`) instead of from Claude's handoff:
   oldest first, after any `priority_labels`; issues assigned to someone else, labelled with a

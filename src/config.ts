@@ -13,6 +13,11 @@ const repoAlias = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/, "repo aliases use letters, digits, '.', '_' or '-'");
 
+/** A GitHub user name (bots are never trusted to answer, so `[bot]` accounts are rejected). */
+const githubLogin = z
+  .string()
+  .regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, "not a GitHub user name (letters, digits, '-')");
+
 /** A percentage of a usage window, 0–100 (0 = no limit). */
 const percent = z.number().min(0).max(100);
 
@@ -173,6 +178,13 @@ const configSchema = z.strictObject({
     })
     .prefault({}),
   notify: z.strictObject({ command: z.string().default("") }).prefault({}),
+  answers: z
+    .strictObject({
+      via: z.enum(["terminal", "github"]).default("terminal"),
+      users: z.array(githubLogin).default([]),
+      poll_seconds: z.number().int().min(30).max(3600).default(120),
+    })
+    .prefault({}),
   prompts: z.strictObject({ dir: z.string().min(1).optional() }).prefault({}),
 });
 

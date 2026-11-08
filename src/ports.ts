@@ -116,11 +116,22 @@ export interface Forge {
   listIssues(repoSlug: string, label: string): Promise<Issue[]>;
   issue(repoSlug: string, number: number): Promise<Issue>;
   editIssue(repoSlug: string, number: number, edit: IssueEdit): Promise<void>;
-  commentIssue(repoSlug: string, number: number, body: string): Promise<void>;
+  /** Comments on an issue or a PR (`number`), in its conversation tab. */
+  commentIssue(repoSlug: string, number: number, body: string): Promise<PostedComment>;
   /** Closes the issue as completed, with a comment. */
   closeIssue(repoSlug: string, number: number, comment: string): Promise<void>;
   /** Creates the label if the repository does not have it yet. */
   ensureLabel(repoSlug: string, name: string, color: string, description: string): Promise<void>;
+
+  // ── conversation (asking a human on GitHub, `[answers] via = "github"`) ──
+  createIssue(
+    repoSlug: string,
+    title: string,
+    body: string,
+  ): Promise<PostedComment & { number: number }>;
+  /** Comments on an issue or PR created at or after `since` (ISO), oldest first. */
+  listComments(repoSlug: string, number: number, since: string): Promise<IssueComment[]>;
+  addReaction(repoSlug: string, commentId: number, content: "+1" | "eyes"): Promise<void>;
 }
 
 export type IssueState = "OPEN" | "CLOSED";
@@ -142,6 +153,25 @@ export interface IssueEdit {
   removeLabels?: string[];
   addAssignees?: string[];
   removeAssignees?: string[];
+}
+
+/** A comment nightshift posted, or an issue it opened (`id` is the issue's own id). */
+export interface PostedComment {
+  id: number;
+  url: string;
+  /** GitHub's timestamp (ISO), so replies are compared on GitHub's clock. */
+  createdAt: string;
+}
+
+/** A comment in a PR's or issue's conversation. */
+export interface IssueComment {
+  id: number;
+  author: string;
+  /** A GitHub App or other bot account. */
+  authorIsBot: boolean;
+  body: string;
+  createdAt: string;
+  url: string;
 }
 
 export interface ReviewRequest {

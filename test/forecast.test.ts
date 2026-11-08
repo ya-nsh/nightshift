@@ -465,6 +465,12 @@ describe("pipeline: starting a new item only if it fits", () => {
     expect(exit.reason).toContain("forecast: a typical item uses ~6 points");
     expect(exit.reason).toContain("not starting a new item before the 5-hour window resets");
     expect(agent.requests).toHaveLength(0);
+    // The daemon resumes it once the window has reset.
+    expect(state.stop).toMatchObject({ kind: "paused", cause: "forecast_usage" });
+    expect(Date.parse(state.stop?.resumeAt ?? "")).toBeGreaterThanOrEqual(plan.resetsAt);
+    const report = await readFile(path.join(h.config.dir, "report.md"), "utf8");
+    expect(report).toContain("## Forecast");
+    expect(report).toContain("held back item 1: a typical item uses ~6 points");
     expect(state.item?.startedAt).toBeUndefined();
 
     h.host.time = new Date(plan.resetsAt + 1000);
@@ -525,9 +531,14 @@ describe("pipeline: starting a new item only if it fits", () => {
     h.config.schedule.outside_hours = "halt";
     h.host.time = at(6, 40);
     const agent = new FakeAgent([]);
-    const exit = await start(h, agent).pipeline.run({ signal: new AbortController().signal });
+    const { pipeline, state } = start(h, agent);
+    const exit = await pipeline.run({ signal: new AbortController().signal });
     expect(exit.kind).toBe("paused");
     expect(exit.reason).toContain("not starting a new item before active hours start again 23:00");
+    expect(state.stop).toMatchObject({
+      cause: "forecast_hours",
+      resumeAt: at(23).toISOString(),
+    });
   });
 
   it("starts with too little history, and can be turned off", async () => {

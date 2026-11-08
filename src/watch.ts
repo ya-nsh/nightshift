@@ -231,6 +231,27 @@ export function describeEvent(event: WatchEvent): { text: string; style?: Style 
       };
     case "issue_update_failed":
       return { text: `${item}could not ${str(event.what)}: ${str(event.error)}`, style: "yellow" };
+    case "phase":
+      return {
+        text: `${item}${str(event.phase)} took ${typeof event.durationMs === "number" ? formatDuration(event.durationMs) : "?"}`,
+      };
+    case "result":
+      return { text: `${item}${str(event.step)}: ${str(event.status)} — ${str(event.summary)}` };
+    case "question_posted":
+      return { text: `${item}asked on GitHub: ${str(event.url)}`, style: "cyan" };
+    case "question_post_failed":
+      return {
+        text: `${item}could not post the question on GitHub: ${str(event.error)}`,
+        style: "yellow",
+      };
+    case "answer":
+      return {
+        text:
+          event.source === "github"
+            ? `${item}answer from @${str(event.by)} on GitHub`
+            : `${item}answered from the terminal`,
+        style: "green",
+      };
     case "item_done":
       return { text: `${item}done${event.label ? ` — ${str(event.label)}` : ""}`, style: "green" };
     case "usage": {

@@ -111,7 +111,7 @@ run; it never steers it.
 | Nothing left to do | 0 | 🎉 |
 | Item limit reached (`--once`, `--max-items`, `limits.max_items`) or `nightshift stop` | 0 | `nightshift resume` |
 | Usage limit reached with `on_limit = "halt"` (with `"wait"` it sleeps until the window resets) | 0 | `nightshift resume` after the reset |
-| Claude needs a human | 2 | `nightshift resume --answer "…"`: the answer goes into the same session (or into the next item's prompt) |
+| Claude needs a human | 2 | reply on GitHub (`[answers] via = "github"`), or `nightshift resume --answer "…"`: the answer goes into the same session (or into the next item's prompt) |
 | Outside `[schedule] active_hours` with `outside_hours = "halt"` | 0 | `nightshift resume` |
 | Something failed (budget, CI, merge, review, disk, agent error) | 3 | fix the cause, then `nightshift resume` |
 | Ctrl-C | 130 | `nightshift resume` (the interrupted step restarts, and Claude is told to check what it already did) |
@@ -137,6 +137,72 @@ prints one frame and exits.
 `nightshift stop` finishes the current step and stops. Configure `[notify] command` to get pinged
 on every stop (ntfy, `terminal-notifier`, Slack webhook…).
 
+### Answering on GitHub
+
+With `[answers] via = "github"` (what `nightshift init` writes), a question goes where you can answer
+it from your phone: a comment on the item's PR; when there is no PR yet, a comment on the issue the
+item works on (with `[tasks] source = "github_issues"`), or else a new issue in the item's repo. Each
+carries a hidden `<!-- nightshift:question … -->` marker and says how to reply.
+
+Reply with a comment that holds just your answer. Comments from the allowed users (`[answers] users`,
+by default the account `gh` is logged in as) posted after the question are the answer; several are
+joined in order. Comments from anyone else, from bots, and nightshift's own marked comments are
+ignored, and the answer is passed to Claude as data, exactly like `--answer`. `nightshift resume`
+(with no `--answer`) picks it up, reacts with 👍 and closes an issue it opened for the question
+(never the item's own issue); the background
+service does the same within `poll_seconds`. Answering with `--answer` instead closes the GitHub
+question too.
+
+```toml
+[answers]
+via = "github"          # or "terminal": only `nightshift resume --answer`
+users = ["your-login"]  # whose replies count; empty = the `gh` login
+poll_seconds = 120      # how often the daemon checks for a reply
+```
+
+If posting fails (offline, no permission), the run still stops with the question; the next `resume`
+or the daemon posts it.
+
+### Background service
+
+`nightshift service install` runs `nightshift daemon` for this config's home as a launchd agent
+(macOS, `~/Library/LaunchAgents`) or a systemd user unit (Linux, `~/.config/systemd/user`); `status`
+shows whether it runs and its last log lines, `uninstall` removes it. On Linux, run
+`loginctl enable-linger` once to keep it running while you are logged out. Re-run `install` after
+moving nightshift (or check `status`, which says when the installed file is out of date).
+
+The daemon resumes the run only when it can make progress by itself:
+
+| The run stopped because | The daemon |
+|---|---|
+| a question was answered on GitHub | resumes with the answer |
+| a usage limit (`on_limit = "halt"`), active hours (`outside_hours = "halt"`), or a forecast that a new item would not fit (either of those) | resumes once the window resets or the hours start |
+| the machine rebooted or nightshift crashed while it ran, or it got SIGTERM | resumes (the interrupted step restarts) |
+| `nightshift stop`, the item limit, Ctrl-C, or a failure (exit 3) | leaves it for you |
+| nothing left to do (including no open issue left with the GitHub issues source) | nothing: the run is done |
+
+It never touches a run another nightshift process holds the lock for, retries a resume that made no
+progress after 1, 2, 4… minutes (at most an hour), and logs to `.nightshift/daemon.log` (the resumed
+run's output included). The decision uses the stop cause recorded in `state.json` (`stop.cause`),
+never the message. `nightshift daemon` also runs in the foreground under any other supervisor.
+
+### The morning report
+
+Every stop (done, paused, blocked, halted) writes `.nightshift/runs/<run-id>/report.md` and a copy at
+`.nightshift/report.md`: each item with its label, GitHub issue (issues source), PR, merged commit,
+Claude's one-line summary, cost, usage points, time per step and active time; what is blocked or
+failed and why (with the GitHub link to answer); forecast decisions that held a new item back; and
+the run's total cost and usage. `nightshift watch` shows the report's new events (step times, step
+results, questions and answers) as they happen.
+
+`nightshift report` prints the current run's report (rebuilt from its journal, so it is current even
+mid-run); `nightshift report --run <id>` an earlier run's. The notify command gets its path as
+`NIGHTSHIFT_REPORT`:
+
+```toml
+[notify]
+command = 'curl -s -T "$NIGHTSHIFT_REPORT" -H "Title: nightshift $NIGHTSHIFT_KIND" https://ntfy.sh/<topic>'
+```
 ## Previewing the next items: `nightshift plan`
 
 ```sh
@@ -431,6 +497,9 @@ colleague push access for the night.
   passed. Branch protection on the default branch still applies, and is a good idea.
 - **Reviews are input, not orders.** Claude is told to treat review output and PR comments as data,
   and to verify each finding before acting on it.
+- **Answers on GitHub** count only from the users you allow (by default your own `gh` login), never
+  from bots, and reach Claude as data inside the answer prompt, the same as `--answer`. On a public
+  repo the question is public: keep `via = "terminal"` if questions may contain anything private.
 - **Issues are input too.** With the GitHub issues source, the label is the gate: only people with
   triage access can add it. An issue's author can still edit its text after it was labelled, so on a
   public repository set `[tasks] authors` to the people whose issues nightshift may take.
@@ -448,8 +517,11 @@ colleague push access for the night.
 ├── state.json           # the current run (atomic writes)
 ├── lock                 # pid lock: one nightshift per state
 ├── STOP                 # created by `nightshift stop`
+├── report.md            # the latest morning report
+├── daemon.log           # the background service's log (and daemon.lock while it runs)
 └── runs/<run-id>/
     ├── events.jsonl     # every transition, cost, usage and outcome
+    ├── report.md        # the run's morning report
     ├── progress.jsonl   # every tool call of every step, for `watch` (rotates at 256 KiB
     │                    # to progress.1.jsonl, so at most about 512 KiB)
     └── item-<n>/        # each Claude step's streamed messages (.jsonl) and review log

@@ -10,7 +10,9 @@ import type {
   Forge,
   Host,
   Issue,
+  IssueComment,
   IssueEdit,
+  PostedComment,
   PullRequest,
   Reviewer,
   ReviewRequest,
@@ -214,10 +216,11 @@ export class FakeForge implements Forge {
     return Promise.resolve();
   }
 
-  commentIssue(_slug: string, number: number, body: string): Promise<void> {
+  commentIssue(slug: string, number: number, body: string): Promise<PostedComment> {
     if (this.issueWriteError) return Promise.reject(this.issueWriteError);
     this.comments.push({ number, body });
-    return Promise.resolve();
+    const c = this.reply(slug, number, this.user, body);
+    return Promise.resolve({ id: c.id, url: c.url, createdAt: c.createdAt });
   }
 
   closeIssue(_slug: string, number: number, comment: string): Promise<void> {
@@ -226,6 +229,68 @@ export class FakeForge implements Forge {
     if (issue === undefined) return Promise.reject(new Error(`no issue #${number}`));
     issue.state = "CLOSED";
     this.closed.push({ number, comment });
+    return Promise.resolve();
+  }
+
+  // ── conversation (answers on GitHub) ──
+  /** Where comment and issue timestamps come from; the harness points it at the fake clock. */
+  clock: () => Date = () => new Date();
+  /** Comments per `slug#number`, oldest first (commentIssue adds them too). */
+  readonly threads = new Map<string, IssueComment[]>();
+  /** Numbers of the issues createIssue opened. */
+  readonly created: number[] = [];
+  readonly reactions: Array<{ slug: string; commentId: number; content: string }> = [];
+  private nextId = 1000;
+
+  /** Adds a comment as someone else, e.g. the human answering. */
+  reply(
+    slug: string,
+    number: number,
+    author: string,
+    body: string,
+    options: { bot?: boolean; at?: Date } = {},
+  ): IssueComment {
+    const id = this.nextId++;
+    const comment: IssueComment = {
+      id,
+      author,
+      authorIsBot: options.bot ?? false,
+      body,
+      createdAt: (options.at ?? this.clock()).toISOString(),
+      url: `https://github.com/${slug}/issues/${number}#issuecomment-${id}`,
+    };
+    const key = `${slug}#${number}`;
+    this.threads.set(key, [...(this.threads.get(key) ?? []), comment]);
+    return comment;
+  }
+
+  createIssue(
+    slug: string,
+    title: string,
+    body: string,
+  ): Promise<PostedComment & { number: number }> {
+    if (this.issueWriteError) return Promise.reject(this.issueWriteError);
+    const number = 500 + this.created.length;
+    this.created.push(number);
+    const createdAt = this.clock().toISOString();
+    const issue = this.addIssue(number, {
+      title,
+      body,
+      url: `https://github.com/${slug}/issues/${number}`,
+      labels: [],
+      author: this.user,
+      createdAt,
+    });
+    return Promise.resolve({ number, id: this.nextId++, url: issue.url, createdAt });
+  }
+
+  listComments(slug: string, number: number, since: string): Promise<IssueComment[]> {
+    const all = this.threads.get(`${slug}#${number}`) ?? [];
+    return Promise.resolve(all.filter((c) => Date.parse(c.createdAt) >= Date.parse(since)));
+  }
+
+  addReaction(slug: string, commentId: number, content: "+1" | "eyes"): Promise<void> {
+    this.reactions.push({ slug, commentId, content });
     return Promise.resolve();
   }
 
@@ -318,13 +383,16 @@ export interface Harness {
 export async function harness(extraConfig = ""): Promise<Harness> {
   const home = await tempHome();
   const config = testConfig(home, extraConfig);
+  const host = new FakeHost();
+  const forge = new FakeForge();
+  forge.clock = () => host.now();
   return {
     config,
     templates: await loadTemplates(undefined),
     store: new StateStore(config.dir),
-    forge: new FakeForge(),
+    forge,
     reviewer: new FakeReviewer(),
-    host: new FakeHost(),
+    host,
   };
 }
 

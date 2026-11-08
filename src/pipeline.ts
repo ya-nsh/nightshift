@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { z } from "zod";
+import { acknowledge, allowedUsers, findAnswer, postQuestion } from "./answers.js";
 import { type AgentStep, type Config, type StepSettings, stepSettings } from "./config.js";
 import { decideStart, estimateItem, readHistory } from "./forecast.js";
 import {
@@ -23,6 +24,7 @@ import type {
   UsageMeter,
   UsageWindows,
 } from "./ports.js";
+import { writeReport } from "./report.js";
 import { isActive, nextStart } from "./schedule.js";
 import {
   finalizeIssueResult,
@@ -33,7 +35,7 @@ import {
   stepResult,
   toJsonSchema,
 } from "./schemas.js";
-import type { ItemIssue, ItemState, Phase, RunState, StateStore } from "./state.js";
+import type { ItemIssue, ItemState, Phase, RunState, StateStore, StopCause } from "./state.js";
 import { render, type TemplateName, type Templates } from "./templates.js";
 import {
   account,
@@ -176,6 +178,8 @@ export class Pipeline {
   private invocationCostUsd = 0;
   private itemsThisInvocation = 0;
   private signal: AbortSignal = new AbortController().signal;
+  /** The phase running now, so a stop can record its time before writing the report. */
+  private openPhase: { item: number; phase: Phase; startedAt: number } | undefined;
   /** Time spent in usage, schedule and forecast waits, so item time can leave it out. */
   private waitedMs = 0;
   /** When the running step started, and `waitedMs` then. */
@@ -202,13 +206,22 @@ export class Pipeline {
         throw new Error("the run is not waiting for an answer (no open question)");
       }
       item.pendingAnswer = options.answer;
+      await this.answeredLocally(item);
     } else if (item?.pendingQuestion !== undefined && item.pendingAnswer === undefined) {
-      throw new Error(`the run is waiting for an answer: ${item.pendingQuestion}\nuse --answer`);
+      if (!(await this.answerFromGitHub(item))) {
+        await this.save();
+        const where =
+          item.questionPost === undefined
+            ? "use --answer"
+            : `reply on ${item.questionPost.url}, or use --answer`;
+        throw new Error(`the run is waiting for an answer: ${item.pendingQuestion}\n${where}`);
+      }
     }
     if (item !== undefined) this.freshStart(item);
     const maxItems = options.maxItems ?? this.deps.config.limits.max_items;
     this.state.status = "running";
     delete this.state.haltReason;
+    delete this.state.stop;
     this.deps.host.clearStop();
     await this.save();
     await this.event({ type: "invocation_start", item: item?.index, phase: item?.phase });
@@ -219,7 +232,7 @@ export class Pipeline {
         if (this.signal.aborted) throw new Aborted();
         if (this.deps.host.stopRequested()) {
           this.deps.host.clearStop();
-          return await this.pause("stop requested (STOP file)");
+          return await this.pause("stop requested (STOP file)", "stop_requested");
         }
         let current = this.state.item;
         if (current === undefined) {
@@ -232,12 +245,15 @@ export class Pipeline {
         const exit = await this.step(current);
         if (exit) return exit;
         if (current !== this.state.item && maxItems > 0 && this.itemsThisInvocation >= maxItems) {
-          return await this.pause(`item limit reached (${maxItems} this invocation)`);
+          return await this.pause(`item limit reached (${maxItems} this invocation)`, "item_limit");
         }
       }
     } catch (error) {
       if (error instanceof Aborted || this.signal.aborted) {
-        return await this.halt("interrupted", "halted");
+        // SIGTERM is a shutdown or a service stop, not a person choosing to stop the run.
+        return this.signal.reason === "SIGTERM"
+          ? await this.halt("terminated (SIGTERM)", "halted", "terminated")
+          : await this.halt("interrupted", "halted", "interrupted");
       }
       return await this.halt(`error: ${(error as Error).message}`, "halted");
     }
@@ -272,6 +288,11 @@ export class Pipeline {
     const restarted = item.inFlight === item.phase || item.interruptedPhase === item.phase;
     item.inFlight = item.phase;
     await this.save();
+    this.openPhase = {
+      item: item.index,
+      phase: item.phase,
+      startedAt: this.deps.host.now().getTime(),
+    };
     this.stepClock = { at: this.deps.host.now().getTime(), waited: this.waitedMs };
     let exit: Exit | undefined;
     try {
@@ -283,7 +304,17 @@ export class Pipeline {
     }
     delete item.inFlight;
     await this.save();
+    await this.closePhase();
     return exit;
+  }
+
+  /** Records how long the open phase ran (for the report's time per step). */
+  private async closePhase(): Promise<void> {
+    const open = this.openPhase;
+    if (open === undefined) return;
+    this.openPhase = undefined;
+    const durationMs = this.deps.host.now().getTime() - open.startedAt;
+    await this.event({ type: "phase", item: open.item, phase: open.phase, durationMs });
   }
 
   /** The item's active time, including the running step so far (without its waits). */
@@ -436,7 +467,7 @@ export class Pipeline {
       if (this.signal.aborted) throw new Aborted();
       if (this.deps.host.stopRequested()) {
         this.deps.host.clearStop();
-        return this.pause("stop requested (STOP file)");
+        return this.pause("stop requested (STOP file)", "stop_requested");
       }
       const current = await this.deps.forge.pullRequest(pr.repoSlug, pr.number);
       if (current.state === "MERGED") {
@@ -930,12 +961,18 @@ export class Pipeline {
     if (item === undefined || issue === undefined) return;
     const { forge } = this.deps;
     const blocked = this.deps.config.tasks.blocked_label;
+    const post = kind === "blocked" ? item.questionPost : undefined;
+    if (post !== undefined && post.repoSlug === issue.repoSlug && post.number === issue.number) {
+      issue.noted = reason; // the question itself is on this issue already
+    }
     if (issue.noted !== reason) {
       await this.github(item, `comment on issue #${issue.number}`, async () => {
         const next =
-          kind === "blocked"
-            ? 'It needs an answer: whoever runs nightshift continues with `nightshift resume --answer "…"`.'
-            : "Once the cause is fixed, `nightshift resume` continues; `nightshift run --force` abandons the run and releases this issue.";
+          kind !== "blocked"
+            ? "Once the cause is fixed, `nightshift resume` continues; `nightshift run --force` abandons the run and releases this issue."
+            : post !== undefined
+              ? `It needs an answer: reply on ${post.url}, and nightshift continues.`
+              : 'It needs an answer: whoever runs nightshift continues with `nightshift resume --answer "…"`.';
         const pr = item.pr === undefined ? "" : `\n\nPull request: ${item.pr.url}`;
         await forge.commentIssue(
           issue.repoSlug,
@@ -1093,7 +1130,17 @@ export class Pipeline {
           // interrupted step that is resumed gets it again instead of losing it.
           delete item.pendingAnswer;
           delete item.pendingQuestion;
+          delete item.questionPost;
           await this.save();
+          const data = parsed.data as { status?: unknown; summary?: unknown; item?: unknown };
+          await this.event({
+            type: "result",
+            item: item.index,
+            step: template,
+            status: data.status,
+            summary: data.summary,
+            label: typeof data.item === "string" ? data.item : item.label,
+          });
           return { ok: true, value: parsed.data };
         }
         const issues = parsed.error.issues
@@ -1229,6 +1276,8 @@ export class Pipeline {
           ok: false,
           exit: await this.pause(
             `usage limit: ${hit.reason}; the ${WINDOW_LABEL[hit.window]} window resets ${formatTime(hit.resetsAt, now)}`,
+            "usage_limit",
+            new Date(until),
           ),
         };
       }
@@ -1303,16 +1352,18 @@ export class Pipeline {
     let stopped: Exit | undefined;
     if (decision.kind === "usage") {
       const label = WINDOW_LABEL[decision.window];
-      if (usage.on_limit === "halt") {
-        return this.pause(
-          `forecast: ${decision.reason}; not starting a new item before the ${label} window resets ${formatTime(decision.until, now)}`,
-        );
-      }
       const resetsAt = decision.until === undefined ? Number.NaN : Date.parse(decision.until);
       const until = Math.max(
         Number.isNaN(resetsAt) ? 0 : resetsAt + USAGE_RESET_GRACE_MS,
         now.getTime() + usage.check_seconds * 1000,
       );
+      if (usage.on_limit === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before the ${label} window resets ${formatTime(decision.until, now)}`,
+          "forecast_usage",
+          new Date(until),
+        );
+      }
       stopped = await this.sleepUntil(
         until,
         `forecast: ${decision.reason}`,
@@ -1323,6 +1374,8 @@ export class Pipeline {
       if (schedule.outside_hours === "halt") {
         return this.pause(
           `forecast: ${decision.reason}; not starting a new item before active hours start again ${formatTime(decision.until.toISOString(), now)}`,
+          "forecast_hours",
+          decision.until,
         );
       }
       stopped = await this.sleepUntil(
@@ -1349,6 +1402,8 @@ export class Pipeline {
     if (outside_hours === "halt") {
       return this.pause(
         `outside active hours (${hours}); they start again ${formatTime(start.toISOString(), now)}`,
+        "outside_hours",
+        start,
       );
     }
     return this.sleepUntil(start.getTime(), `outside active hours (${hours})`, "", "schedule_wait");
@@ -1384,7 +1439,7 @@ export class Pipeline {
       if (this.signal.aborted) throw new Aborted();
       if (this.deps.host.stopRequested()) {
         this.deps.host.clearStop();
-        return this.pause("stop requested (STOP file)");
+        return this.pause("stop requested (STOP file)", "stop_requested");
       }
       const left = until - this.deps.host.now().getTime();
       if (left <= 0) return undefined;
@@ -1605,43 +1660,150 @@ export class Pipeline {
     );
   }
 
-  private blocked(item: ItemState, question: string): Promise<Exit> {
+  private async blocked(item: ItemState, question: string): Promise<Exit> {
     item.pendingQuestion = question;
-    return this.halt(`needs a human: ${question}`, "blocked");
+    delete item.questionPost;
+    if (this.deps.config.answers.via === "github") await this.askOnGitHub(item, question);
+    return this.halt(`needs a human: ${question}`, "blocked", "question");
   }
 
-  private pause(reason: string): Promise<Exit> {
-    return this.halt(reason, "paused");
+  // ── answers on GitHub ───────────────────────────────────────────────────
+
+  /** Posts the open question on the item's PR (or a new issue). A failure is logged, not fatal. */
+  private async askOnGitHub(item: ItemState, question: string): Promise<void> {
+    const { forge, config } = this.deps;
+    try {
+      item.questionPost = await postQuestion(forge, config, this.state.runId, item, question, () =>
+        forge.repoSlug(this.repoPath(item)),
+      );
+    } catch (error) {
+      this.log(item, `could not post the question on GitHub: ${(error as Error).message}`);
+      await this.event({
+        type: "question_post_failed",
+        item: item.index,
+        error: (error as Error).message,
+      });
+      return;
+    }
+    this.log(item, `asked on GitHub: ${item.questionPost.url}`);
+    await this.event({
+      type: "question_posted",
+      item: item.index,
+      kind: item.questionPost.kind,
+      url: item.questionPost.url,
+    });
   }
 
-  private async halt(reason: string, kind: "halted" | "blocked" | "paused"): Promise<Exit> {
+  /**
+   * With `[answers] via = "github"`, looks for a reply to the open question and makes it the
+   * pending answer. Posts the question first if that failed when the run stopped. Returns whether
+   * an answer was found.
+   */
+  private async answerFromGitHub(item: ItemState): Promise<boolean> {
+    const { forge, config } = this.deps;
+    if (config.answers.via !== "github" || item.pendingQuestion === undefined) return false;
+    const post = item.questionPost;
+    if (post === undefined) {
+      await this.askOnGitHub(item, item.pendingQuestion);
+      return false;
+    }
+    let answer: Awaited<ReturnType<typeof findAnswer>>;
+    try {
+      answer = await findAnswer(forge, post, await allowedUsers(config, forge));
+    } catch (error) {
+      throw new Error(
+        `could not read the answer to the open question on GitHub (${post.url}): ${(error as Error).message}`,
+      );
+    }
+    if (answer === undefined) return false;
+    item.pendingAnswer = answer.text;
+    this.log(item, `answer from @${answer.by.join(", @")} on GitHub: ${post.url}`);
+    await this.save();
+    await this.event({
+      type: "answer",
+      item: item.index,
+      source: "github",
+      by: answer.by.join(", "),
+      url: answer.comments[0]?.url,
+    });
+    for (const problem of await acknowledge(forge, post, answer)) this.log(item, problem);
+    delete item.questionPost; // answered and acknowledged; the answer is kept until a step succeeds
+    await this.save();
+    return true;
+  }
+
+  /** An answer given with `--answer` closes the question asked on GitHub. */
+  private async answeredLocally(item: ItemState): Promise<void> {
+    const post = item.questionPost;
+    if (post === undefined) return;
+    await this.event({ type: "answer", item: item.index, source: "terminal" });
+    for (const problem of await acknowledge(this.deps.forge, post, undefined)) {
+      this.log(item, problem);
+    }
+    delete item.questionPost;
+  }
+
+  private pause(reason: string, cause: StopCause, resumeAt?: Date): Promise<Exit> {
+    return this.halt(reason, "paused", cause, resumeAt);
+  }
+
+  private async halt(
+    reason: string,
+    kind: "halted" | "blocked" | "paused",
+    cause: StopCause = kind === "blocked" ? "question" : "failure",
+    resumeAt?: Date,
+  ): Promise<Exit> {
     this.state.status = "halted";
     this.state.haltReason = reason;
+    this.state.stop = {
+      kind,
+      cause,
+      at: this.deps.host.now().toISOString(),
+      ...(resumeAt === undefined ? {} : { resumeAt: resumeAt.toISOString() }),
+    };
     // A planned pause or Ctrl-C is no news for the issue; everything else needs a human.
     if (kind !== "paused" && !this.signal.aborted) await this.noteIssue(reason, kind);
     await this.save();
+    await this.closePhase();
     await this.event({
       type: kind,
       reason,
+      cause,
       item: this.state.item?.index,
       phase: this.state.item?.phase,
     });
     this.deps.host.log(`${kind}: ${reason}`);
-    await this.deps.host.notify("halted", this.notifyFields(kind, reason));
+    const report = await this.report();
+    await this.deps.host.notify("halted", this.notifyFields(kind, reason, report));
     return { kind, reason, state: this.state };
   }
 
   private async finish(reason: string): Promise<Exit> {
     this.state.status = "done";
     this.state.haltReason = reason;
+    this.state.stop = { kind: "done", cause: "done", at: this.deps.host.now().toISOString() };
     await this.save();
+    await this.closePhase();
     await this.event({ type: "done", reason, itemsCompleted: this.state.itemsCompleted });
     this.deps.host.log(`done: ${reason}`);
-    await this.deps.host.notify("done", this.notifyFields("done", reason));
+    const report = await this.report();
+    await this.deps.host.notify("done", this.notifyFields("done", reason, report));
     return { kind: "done", reason, state: this.state };
   }
 
-  private notifyFields(kind: string, reason: string): Record<string, string> {
+  /** Writes the morning report; returns its path, or "" when it could not be written. */
+  private async report(): Promise<string> {
+    try {
+      const file = await writeReport(this.deps.store, this.state, this.deps.host.now());
+      this.deps.host.log(`report: ${file}`);
+      return file;
+    } catch (error) {
+      this.deps.host.log(`could not write the report: ${(error as Error).message}`);
+      return "";
+    }
+  }
+
+  private notifyFields(kind: string, reason: string, report: string): Record<string, string> {
     const item = this.state.item;
     return {
       kind,
@@ -1650,6 +1812,8 @@ export class Pipeline {
       item: item ? (item.label ?? String(item.index)) : "",
       pr: item?.pr?.url ?? "",
       cost: this.state.costUsd.toFixed(2),
+      question_url: item?.questionPost?.url ?? "",
+      report,
     };
   }
 

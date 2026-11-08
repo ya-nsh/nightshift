@@ -5,7 +5,9 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { ClaudeCliAgent } from "./agent/cli.js";
 import { ClaudeSdkAgent, loadSdkQuery } from "./agent/sdk.js";
-import { type Config, ConfigError, loadConfig, planSettings } from "./config.js";
+import { type Config, ConfigError, findConfig, loadConfig, planSettings } from "./config.js";
+import { cliPath, DAEMON_LOCK, DAEMON_LOG, daemonLogger, runDaemon } from "./daemon.js";
+import { exec } from "./exec.js";
 import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { GhForge } from "./github.js";
 import { NodeHost, STOP_FILE } from "./host.js";
@@ -15,7 +17,18 @@ import { type Exit, newIssuesRunState, newRunState, Pipeline } from "./pipeline.
 import { formatPlan, makePlan, PlanError, parsePlanCount, writePlan } from "./plan.js";
 import type { Agent } from "./ports.js";
 import { preflight } from "./preflight.js";
+import { loadReport } from "./report.js";
 import { ShellReviewer } from "./reviewer.js";
+import {
+  installService,
+  installWarnings,
+  type Runner,
+  ServiceError,
+  serviceSpec,
+  serviceStatus,
+  stableNodePath,
+  uninstallService,
+} from "./service.js";
 import { Lock, LockedError, lockHolder, newRunId, type RunState, StateStore } from "./state.js";
 import { loadTemplates } from "./templates.js";
 import {
@@ -54,6 +67,12 @@ Usage:
   nightshift watch [--once]                  follow the current run live (q quits; --once prints
                                              one frame)
   nightshift stop                            stop gracefully after the current step
+  nightshift report [--run ID]               print the run's report (default: the current run)
+  nightshift daemon                          watch the run and resume it when it can continue
+                                             by itself (answer on GitHub, limit cleared, reboot)
+  nightshift service install|uninstall|status
+                                             run the daemon as a launchd agent (macOS) or a
+                                             systemd user unit (Linux)
 
 Options:
   --config FILE   use this config instead of the nearest .nightshift/config.toml
@@ -68,7 +87,20 @@ Options:
 Exit codes: 0 done or paused · 1 error · 2 blocked on a question · 3 halted · 130 interrupted
 Docs: https://github.com/ya-nsh/nightshift`;
 
-const COMMANDS = new Set(["init", "doctor", "run", "resume", "plan", "status", "watch", "stop"]);
+const COMMANDS = new Set([
+  "init",
+  "doctor",
+  "run",
+  "resume",
+  "plan",
+  "status",
+  "watch",
+  "stop",
+  "report",
+  "daemon",
+  "service",
+]);
+const SERVICE_ACTIONS = new Set(["install", "uninstall", "status"]);
 const EXIT_CODES: Record<Exit["kind"], number> = { done: 0, paused: 0, blocked: 2, halted: 3 };
 
 async function main(argv: string[]): Promise<number> {
@@ -85,6 +117,7 @@ async function main(argv: string[]): Promise<number> {
       "usage-share": { type: "string" },
       force: { type: "boolean", default: false },
       answer: { type: "string" },
+      run: { type: "string" },
       json: { type: "boolean", default: false },
       count: { type: "string", short: "n" },
       write: { type: "boolean", default: false },
@@ -102,9 +135,15 @@ async function main(argv: string[]): Promise<number> {
     console.log(HELP);
     return command === undefined && !values.help ? 1 : 0;
   }
-  if (positionals.length > 1) throw new UsageError(`unexpected argument: ${positionals[1]}`);
+  const action = command === "service" ? positionals[1] : undefined;
+  if (positionals.length > (command === "service" ? 2 : 1)) {
+    throw new UsageError(`unexpected argument: ${positionals[positionals.length - 1]}`);
+  }
 
   if (!COMMANDS.has(command)) throw new UsageError(`unknown command "${command}" (see --help)`);
+  if (command === "service" && (action === undefined || !SERVICE_ACTIONS.has(action))) {
+    throw new UsageError("usage: nightshift service install|uninstall|status");
+  }
   const cwd = process.cwd();
   if (command === "init") {
     const result = await init(cwd, { ejectPrompts: values["eject-prompts"] });
@@ -154,6 +193,21 @@ async function main(argv: string[]): Promise<number> {
       return await status(await store.load(), values.json, config);
     case "watch":
       return watch({ dir: config.dir, usage: config.usage, once: values.once });
+    case "report": {
+      const report = await loadReport(store, values.run, new Date()).catch((error: Error) => {
+        throw new UsageError(error.message);
+      });
+      if (report === undefined) {
+        console.log(values.run === undefined ? "no run yet" : `no run ${values.run}`);
+        return values.run === undefined ? 0 : 1;
+      }
+      process.stdout.write(report);
+      return 0;
+    }
+    case "daemon":
+      return daemon(config, store, configFile(values.config, cwd));
+    case "service":
+      return service(action as string, config, configFile(values.config, cwd));
     case "stop":
       await writeFile(path.join(config.dir, STOP_FILE), `${new Date().toISOString()}\n`);
       console.log("nightshift will stop after the current step");
@@ -249,11 +303,12 @@ async function drive(
 
   const controller = new AbortController();
   let interrupts = 0;
-  const onSignal = () => {
+  const onSignal = (signal: NodeJS.Signals) => {
     interrupts += 1;
     if (interrupts > 1) process.exit(130);
     host.log("interrupting: stopping the current step and saving state (Ctrl-C again to force)");
-    controller.abort();
+    // The pipeline records SIGTERM (shutdown, service stop) apart from Ctrl-C.
+    controller.abort(signal);
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
@@ -365,6 +420,10 @@ function printExit(exit: Exit): void {
     `items completed: ${state.itemsCompleted} · total cost: $${state.costUsd.toFixed(2)}${formatPoints(state.usage?.points)}`,
   ];
   if (state.item?.pr) lines.push(`current PR: ${state.item.pr.url}`);
+  const post = state.item?.questionPost;
+  if (exit.kind === "blocked" && post !== undefined) {
+    lines.push(`answer on GitHub: ${post.url} (then \`nightshift resume\`, or let the daemon)`);
+  }
   if (exit.kind === "blocked") lines.push('answer and continue: nightshift resume --answer "…"');
   else if (exit.kind !== "done") lines.push("continue with: nightshift resume");
   console.log(lines.join("\n"));
@@ -424,6 +483,9 @@ async function status(state: RunState | undefined, json: boolean, config: Config
       );
     }
     if (item.pendingQuestion) lines.push(`waiting for an answer: ${item.pendingQuestion}`);
+    if (item.pendingQuestion && item.questionPost) {
+      lines.push(`asked on GitHub: ${item.questionPost.url}`);
+    }
   }
   if (state.waiting !== undefined && holder !== undefined) {
     lines.push(`waiting until ${formatTime(state.waiting.until, now)}: ${state.waiting.reason}`);
@@ -471,6 +533,102 @@ function ago(iso: string, now: Date): string {
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes}m`;
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** The absolute path of the config in use, for the daemon and the service to load. */
+function configFile(explicit: string | undefined, cwd: string): string {
+  const file = explicit ? path.resolve(cwd, explicit) : findConfig(cwd);
+  if (file === undefined) throw new UsageError("no config found");
+  return file;
+}
+
+async function daemon(config: Config, store: StateStore, file: string): Promise<number> {
+  const log = daemonLogger(config.dir);
+  const controller = new AbortController();
+  const onSignal = (signal: NodeJS.Signals) => {
+    log(`received ${signal}; stopping (a running resume is sent SIGTERM)`);
+    controller.abort(signal);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  const host = new NodeHost(config.dir, "");
+  try {
+    await runDaemon({
+      configFile: file,
+      load: () => loadConfig(file, config.home),
+      store,
+      forge: new GhForge(),
+      signal: controller.signal,
+      log,
+      driver: () => lockHolder(config.dir),
+      sleep: (ms, signal) => host.sleep(ms, signal),
+    });
+    // A second daemon exits 0 too, so the service manager does not keep restarting it.
+    return 0;
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
+async function service(action: string, config: Config, file: string): Promise<number> {
+  const userHome = process.env.HOME;
+  if (!userHome) throw new UsageError("HOME is not set");
+  const cli = cliPath();
+  let spec: ReturnType<typeof serviceSpec>;
+  try {
+    spec = serviceSpec({
+      platform: process.platform,
+      userHome,
+      xdgConfigHome: process.env.XDG_CONFIG_HOME,
+      home: config.home,
+      dir: config.dir,
+      configFile: file,
+      nodePath: stableNodePath(process.execPath, process.env.PATH ?? ""),
+      cliPath: cli,
+      envPath: process.env.PATH ?? "/usr/bin:/bin",
+    });
+  } catch (error) {
+    if (error instanceof ServiceError) throw new UsageError(error.message);
+    throw error;
+  }
+  const run: Runner = async (command, args) => {
+    const result = await exec(command, args, { timeoutMs: 30_000 });
+    return { code: result.code, output: result.combined };
+  };
+  const uid = process.getuid?.() ?? 0;
+  try {
+    if (action === "install") {
+      for (const warning of installWarnings(cli)) console.error(`warning: ${warning}`);
+      for (const line of await installService(spec, run, uid)) console.log(line);
+      if (config.answers.via !== "github") {
+        console.log(
+          'note: [answers] via = "terminal", so the daemon will not pick up answers from GitHub',
+        );
+      }
+      return 0;
+    }
+    if (action === "uninstall") {
+      for (const line of await uninstallService(spec, run, uid)) console.log(line);
+      return 0;
+    }
+    const st = await serviceStatus(spec, run, uid);
+    const daemonPid = lockHolder(config.dir, DAEMON_LOCK);
+    console.log(
+      [
+        `service ${spec.name}: ${st.installed ? "installed" : "not installed"}${st.stale ? " (out of date: run `nightshift service install` again)" : ""} · ${st.loaded ? "loaded" : "not loaded"} · ${st.running ? `running${st.pid ? ` (pid ${st.pid})` : ""}` : "not running"}`,
+        `file: ${spec.file}`,
+        `daemon: ${daemonPid === undefined ? "not running" : `pid ${daemonPid}`} · log ${path.join(config.dir, DAEMON_LOG)}`,
+      ].join("\n"),
+    );
+    const tail = await readFile(path.join(config.dir, DAEMON_LOG), "utf8").catch(() => "");
+    const last = tail.trimEnd().split("\n").slice(-5).join("\n");
+    if (last !== "") console.log(`\nlast log lines:\n${last}`);
+    return st.installed && st.running ? 0 : 1;
+  } catch (error) {
+    if (error instanceof ServiceError) throw new UsageError(error.message);
+    throw error;
+  }
 }
 
 /** The prompt from --prompt or --prompt-file; undefined when neither is given. */
