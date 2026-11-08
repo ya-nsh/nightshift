@@ -55,6 +55,10 @@ export interface ItemState {
   pendingQuestion?: string;
   pendingAnswer?: string;
   costUsd: number;
+  /** When the item's first implement step started (after the forecast let it start). */
+  startedAt?: string;
+  /** Time spent on the item so far, without usage/schedule waits and pauses (for forecasts). */
+  activeMs?: number;
   /** Percentage points of each usage window this item's steps used (when usage is measured). */
   usagePoints?: Partial<Record<UsageWindow, number>>;
   /** The Claude step running right now, for `status`. */

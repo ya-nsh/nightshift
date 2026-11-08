@@ -88,6 +88,11 @@ weekly_max = 0
 on_limit = "wait"                 # "wait" for the window to reset, or "halt" (pause; resume later)
 check_seconds = 60                # how often usage is re-read while a step runs; a step that
                                   # crosses a limit is stopped and restarted after the reset
+# Forecasts from finished items (this run's and earlier ones'): a new item starts only if a typical
+# item fits in what is left of the shares/max above and of the active hours; otherwise nightshift
+# waits for the reset or the next active range (or pauses, per on_limit / outside_hours).
+# start_item_only_if_it_fits = true   # default: on when limits or active_hours are set
+forecast_percentile = 50          # 50 = median item; higher is more cautious (50–100)
 
 [schedule]
 # Only start Claude work (steps and reviews) in these local-time ranges; a running step finishes.

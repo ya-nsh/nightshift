@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { z } from "zod";
 import { type AgentStep, type Config, type StepSettings, stepSettings } from "./config.js";
+import { decideStart, estimateItem, readHistory } from "./forecast.js";
 import type {
   Agent,
   AgentResult,
@@ -142,6 +143,10 @@ export class Pipeline {
   private invocationCostUsd = 0;
   private itemsThisInvocation = 0;
   private signal: AbortSignal = new AbortController().signal;
+  /** Time spent in usage, schedule and forecast waits, so item time can leave it out. */
+  private waitedMs = 0;
+  /** When the running step started, and `waitedMs` then. */
+  private stepClock: { at: number; waited: number } | undefined;
 
   constructor(
     private readonly deps: PipelineDeps,
@@ -226,10 +231,28 @@ export class Pipeline {
     const restarted = item.inFlight === item.phase || item.interruptedPhase === item.phase;
     item.inFlight = item.phase;
     await this.save();
-    const exit = await this.runPhase(item, restarted);
+    this.stepClock = { at: this.deps.host.now().getTime(), waited: this.waitedMs };
+    let exit: Exit | undefined;
+    try {
+      exit = await this.runPhase(item, restarted);
+    } finally {
+      // A finished item already counted its time (completeItem); only a current one adds it.
+      if (this.state.item === item) item.activeMs = this.activeMs(item);
+      this.stepClock = undefined;
+    }
     delete item.inFlight;
     await this.save();
     return exit;
+  }
+
+  /** The item's active time, including the running step so far (without its waits). */
+  private activeMs(item: ItemState): number {
+    const clock = this.stepClock;
+    const step =
+      clock === undefined
+        ? 0
+        : this.deps.host.now().getTime() - clock.at - (this.waitedMs - clock.waited);
+    return Math.max(0, Math.round((item.activeMs ?? 0) + step));
   }
 
   private runPhase(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
@@ -626,8 +649,12 @@ export class Pipeline {
       };
     }
 
-    const gate = await this.gates();
+    // A new item (not a restart or resume of one already under way) starts only if the forecast
+    // says it fits in what is left of the usage limits and the active hours.
+    const fresh = template === "implement" && !restarted && item.startedAt === undefined;
+    const gate = await this.gates(fresh ? item : undefined);
     if (!gate.ok) return gate;
+    if (fresh) item.startedAt = this.deps.host.now().toISOString();
     // Cleared only once the step really starts again, so a pause before then keeps the restart.
     delete item.interruptedPhase;
 
@@ -866,14 +893,93 @@ export class Pipeline {
    * Everything that must hold before Claude work starts: inside active hours and within the usage
    * limits. A long usage wait can end outside active hours, so both are checked until both hold.
    */
-  private async gates(): Promise<UsageGate> {
+  private async gates(newItem?: ItemState): Promise<UsageGate> {
     for (;;) {
       const outside = await this.scheduleGate();
       if (outside) return { ok: false, exit: outside };
       const gate = await this.usageGate();
       if (!gate.ok) return gate;
-      if (isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) return gate;
+      if (!isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) continue;
+      if (newItem === undefined) return gate;
+      const fit = await this.forecastGate(newItem, gate.before);
+      if (fit === undefined) return gate;
+      if (fit !== "waited") return { ok: false, exit: fit };
     }
+  }
+
+  /** `[usage] start_item_only_if_it_fits`, which defaults to on when limits or hours are set. */
+  private forecastEnabled(): boolean {
+    const { usage, schedule } = this.deps.config;
+    return (
+      usage.start_item_only_if_it_fits ??
+      (limitsEnabled(this.usageLimits()) || schedule.active_hours.length > 0)
+    );
+  }
+
+  /**
+   * Before a new item: estimates a typical item from history and, when it would not fit in what is
+   * left of the usage limits or the active hours, waits for the window reset or the next active
+   * range (or pauses, following on_limit / outside_hours) instead of starting an item that would
+   * be cut half-way. Returns undefined to start, "waited" to check everything again, or an exit.
+   */
+  private async forecastGate(
+    item: ItemState,
+    windows: UsageWindows | undefined,
+  ): Promise<Exit | "waited" | undefined> {
+    if (!this.forecastEnabled()) return undefined;
+    const { usage, schedule, dir } = this.deps.config;
+    const now = this.deps.host.now();
+    const estimate = estimateItem(await readHistory(dir), usage.forecast_percentile);
+    const decision = decideStart({
+      estimate,
+      limits: this.usageLimits(),
+      tally: this.state.usage?.tally ?? {},
+      windows,
+      ranges: schedule.active_hours,
+      now,
+    });
+    this.log(item, `forecast: ${decision.reason}`);
+    await this.event({
+      type: "forecast",
+      item: item.index,
+      start: decision.start,
+      reason: decision.reason,
+    });
+    if (decision.start) return undefined;
+
+    let stopped: Exit | undefined;
+    if (decision.kind === "usage") {
+      const label = WINDOW_LABEL[decision.window];
+      if (usage.on_limit === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before the ${label} window resets ${formatTime(decision.until, now)}`,
+        );
+      }
+      const resetsAt = decision.until === undefined ? Number.NaN : Date.parse(decision.until);
+      const until = Math.max(
+        Number.isNaN(resetsAt) ? 0 : resetsAt + USAGE_RESET_GRACE_MS,
+        now.getTime() + usage.check_seconds * 1000,
+      );
+      stopped = await this.sleepUntil(
+        until,
+        `forecast: ${decision.reason}`,
+        `for the ${label} window to reset before starting a new item`,
+        "forecast_wait",
+      );
+    } else {
+      if (schedule.outside_hours === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before active hours start again ${formatTime(decision.until.toISOString(), now)}`,
+        );
+      }
+      stopped = await this.sleepUntil(
+        decision.until.getTime(),
+        `forecast: ${decision.reason}`,
+        "for the next active hours before starting a new item",
+        "forecast_wait",
+      );
+    }
+    return stopped ?? "waited";
   }
 
   /**
@@ -909,9 +1015,11 @@ export class Pipeline {
     this.state.waiting = { until: untilIso, reason };
     await this.save();
     await this.event({ type: eventType, reason, until: untilIso });
+    const started = this.deps.host.now().getTime();
     try {
       return await this.waitUntil(until);
     } finally {
+      this.waitedMs += Math.max(0, this.deps.host.now().getTime() - started);
       delete this.state.waiting;
       await this.save();
     }
@@ -1121,6 +1229,15 @@ export class Pipeline {
       pr: item.pr?.url,
       mergeSha: item.mergeSha,
       costUsd: item.costUsd,
+      // For forecasts: what the item used of each window (when usage is measured), and its time.
+      ...(limitsEnabled(this.usageLimits())
+        ? {
+            usagePoints: Object.fromEntries(
+              USAGE_WINDOWS.map((w) => [w, item.usagePoints?.[w] ?? 0]),
+            ),
+          }
+        : {}),
+      activeMs: this.activeMs(item),
     });
   }
 

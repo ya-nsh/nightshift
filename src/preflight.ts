@@ -4,6 +4,7 @@ import path from "node:path";
 import { loadSdkQuery, resolveClaudePath, toSdkExtraArgs } from "./agent/sdk.js";
 import { type Config, describeStepSettings, expandHome } from "./config.js";
 import { exec, shellQuote } from "./exec.js";
+import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { isActive, nextStart } from "./schedule.js";
 import {
   ClaudeUsageMeter,
@@ -152,6 +153,21 @@ export async function preflight(
         : `not available (${reading.detail}); fine, no [usage] limits are set`,
     );
   }
+
+  // Informational: what a typical item uses, and how many more fit now.
+  const forecast = describeForecast({
+    estimate: estimateItem(await readHistory(config.dir), config.usage.forecast_percentile),
+    limits,
+    tally: usage.tally ?? {},
+    windows: reading.ok ? reading.windows : undefined,
+    ranges: hours,
+    now: new Date(),
+  });
+  const fitting =
+    (config.usage.start_item_only_if_it_fits ?? (enforced || hours.length > 0))
+      ? "new items start only if they fit"
+      : "start_item_only_if_it_fits is off";
+  add("forecast", true, `${forecast.join(" · ")} · ${fitting}`);
 
   const stats = await statfs(config.home);
   const freeGb = (Number(stats.bavail) * Number(stats.bsize)) / 1e9;

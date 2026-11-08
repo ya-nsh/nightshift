@@ -260,6 +260,41 @@ work starts: outside them nightshift waits for the next range (`outside_hours = 
 default) or pauses (`"halt"`). A step that is already running finishes; CI waits and merges carry on
 at any time. Combine it with `[usage]` to run only overnight, on a share of your plan.
 
+### Forecasts
+
+nightshift learns what a typical item costs from the items it has finished, in this run and earlier
+ones (the `item_done` events in `.nightshift/runs/*/events.jsonl`): points of the 5-hour and weekly
+windows, active time (CI waits count; usage and schedule waits and pauses don't) and dollars. It
+takes the median of the last 20 items (`forecast_percentile = 75` makes it more cautious) and says
+how many items that is based on. With fewer than 3 finished items it says so and holds nothing back.
+
+**Start an item only if it fits.** Before the first step of a new item (not a restart or resume of
+one already under way), nightshift checks that a typical item fits in what is left of nightshift's
+`session_share`/`weekly_share`, under `session_max`/`weekly_max` (and the plan's own 100%), and
+before the active hours end. If it doesn't, it waits for the window to reset or for the next active
+range (or pauses, following `on_limit` / `outside_hours`), instead of starting an item that would
+be cut half-way. Every decision is logged with its reasoning:
+
+```
+[item 4] forecast: a typical item uses ~6 points of the 5-hour window (median of 9 items), but 5 of nightshift's 15-point share left (session_share = 15)
+forecast: …; waiting until 17:01 for the 5-hour window to reset before starting a new item
+```
+
+An item that could never fit (it needs more than a whole share, or longer than the longest active
+range) starts anyway. `[usage] start_item_only_if_it_fits` turns this on or off; by default it is on
+when `[usage]` limits or `active_hours` are set.
+
+`nightshift status` and `nightshift doctor` show the forecast:
+
+```
+forecast: a typical item: ~6 points of the 5-hour window, ~40 min, ~$2.50 (median of the last 9 items)
+forecast: ~3 more items fit in this 5-hour window (resets 03:00) at ~6 points each (median of 9 items)
+forecast: active hours end 07:00 — ~2 items of ~40 min (median of 9 items)
+```
+
+Runs from nightshift 0.3.0 count too: their points are summed from `usage` events and their active
+time is reconstructed from event times.
+
 ### Branch protection
 
 nightshift merges the PR itself, so a rule that requires an approving review blocks it. By default

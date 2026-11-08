@@ -226,8 +226,14 @@ export function describeEvent(event: WatchEvent): { text: string; style?: Style 
     }
     case "usage_cut":
       return { text: `${item}${str(event.step)} stopped: ${str(event.reason)}`, style: "yellow" };
+    case "forecast":
+      return {
+        text: `${item}forecast: ${str(event.reason)}`,
+        ...(event.start === false ? { style: "yellow" as const } : {}),
+      };
     case "usage_wait":
     case "schedule_wait":
+    case "forecast_wait":
       return {
         text: `waiting until ${clock(str(event.until))}: ${str(event.reason)}`,
         style: "yellow",

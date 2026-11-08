@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 import { ClaudeCliAgent } from "./agent/cli.js";
 import { ClaudeSdkAgent, loadSdkQuery } from "./agent/sdk.js";
 import { type Config, ConfigError, loadConfig, planSettings } from "./config.js";
+import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { GhForge } from "./github.js";
 import { NodeHost, STOP_FILE } from "./host.js";
 import { init } from "./init.js";
@@ -147,7 +148,7 @@ async function main(argv: string[]): Promise<number> {
       });
     }
     case "status":
-      return status(await store.load(), values.json, config);
+      return await status(await store.load(), values.json, config);
     case "watch":
       return watch({ dir: config.dir, usage: config.usage, once: values.once });
     case "stop":
@@ -344,7 +345,7 @@ async function doctor(
   return checks.every((check) => check.ok);
 }
 
-function status(state: RunState | undefined, json: boolean, config: Config): number {
+async function status(state: RunState | undefined, json: boolean, config: Config): Promise<number> {
   if (json) {
     console.log(JSON.stringify(state ?? null, null, 2));
     return 0;
@@ -395,6 +396,15 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
   } else if (limitsEnabled(limits)) {
     lines.push("usage: not read yet");
   }
+  const forecast = describeForecast({
+    estimate: estimateItem(await readHistory(config.dir), config.usage.forecast_percentile),
+    limits,
+    tally: usage?.tally ?? {},
+    windows: usage?.last?.windows,
+    ranges: config.schedule.active_hours,
+    now,
+  });
+  for (const line of forecast) lines.push(`forecast: ${line}`);
   console.log(lines.join("\n"));
   return 0;
 }
