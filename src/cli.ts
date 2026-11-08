@@ -5,7 +5,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { ClaudeCliAgent } from "./agent/cli.js";
 import { ClaudeSdkAgent, loadSdkQuery } from "./agent/sdk.js";
-import { type Config, ConfigError, loadConfig } from "./config.js";
+import { type Config, ConfigError, loadConfig, planSettings } from "./config.js";
 import { GhForge } from "./github.js";
 import { NodeHost, STOP_FILE } from "./host.js";
 import { init } from "./init.js";
@@ -25,6 +25,7 @@ import {
   type UsageWindow,
   usageLimits,
 } from "./usage.js";
+import { watch } from "./watch.js";
 
 const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -46,6 +47,8 @@ Usage:
                                              preview the next N items (default 5) in a read-only
                                              Claude session; changes nothing
   nightshift status [--json]                 show the current run
+  nightshift watch [--once]                  follow the current run live (q quits; --once prints
+                                             one frame)
   nightshift stop                            stop gracefully after the current step
 
 Options:
@@ -61,7 +64,7 @@ Options:
 Exit codes: 0 done or paused · 1 error · 2 blocked on a question · 3 halted · 130 interrupted
 Docs: https://github.com/ya-nsh/nightshift`;
 
-const COMMANDS = new Set(["init", "doctor", "run", "resume", "plan", "status", "stop"]);
+const COMMANDS = new Set(["init", "doctor", "run", "resume", "plan", "status", "watch", "stop"]);
 const EXIT_CODES: Record<Exit["kind"], number> = { done: 0, paused: 0, blocked: 2, halted: 3 };
 
 async function main(argv: string[]): Promise<number> {
@@ -145,6 +148,8 @@ async function main(argv: string[]): Promise<number> {
     }
     case "status":
       return status(await store.load(), values.json, config);
+    case "watch":
+      return watch({ dir: config.dir, usage: config.usage, once: values.once });
     case "stop":
       await writeFile(path.join(config.dir, STOP_FILE), `${new Date().toISOString()}\n`);
       console.log("nightshift will stop after the current step");
@@ -280,7 +285,7 @@ async function plan(
   process.on("SIGTERM", onSignal);
   try {
     console.error(
-      `planning the next ${options.count} item(s) · ${agent.name} · read-only · budget $${config.budget.plan_usd.toFixed(2)}`,
+      `planning the next ${options.count} item(s) · ${agent.name} · model ${planSettings(config.agent).model ?? "default"} · read-only · budget $${config.budget.plan_usd.toFixed(2)}`,
     );
     const outcome = await makePlan(
       {

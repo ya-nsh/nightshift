@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Config } from "./config.js";
+import { type Config, planSettings } from "./config.js";
 import type { Agent, UsageMeter } from "./ports.js";
 import { type PlanItem, type PlanResult, planResult, toJsonSchema } from "./schemas.js";
 import type { ItemState, RunState } from "./state.js";
@@ -240,6 +240,7 @@ export async function makePlan(
   const generatedAt = deps.now();
   const stamp = generatedAt.toISOString().replace(/[-:]/g, "").replace(/\..+$/, "");
   const otherRepos = [...new Set(Object.values(config.repos))].filter((dir) => dir !== repoPath);
+  const settings = planSettings(config.agent);
   const result = await deps.agent.run({
     cwd: repoPath,
     prompt,
@@ -248,6 +249,8 @@ export async function makePlan(
     artifactPath: path.join(config.dir, "plans", `${stamp}.jsonl`),
     signal: options.signal,
     readOnly: true,
+    ...(settings.model === undefined ? {} : { model: settings.model }),
+    maxTurns: settings.maxTurns,
     ...(otherRepos.length > 0 ? { addDirs: otherRepos } : {}),
     onEvent: (event) => {
       if (event.type === "tool") deps.log?.(`plan · ${event.name} ${event.detail}`.trimEnd());

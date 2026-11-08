@@ -119,6 +119,17 @@ back, and a checks timeout starts over.
 While a step runs, nightshift logs each tool call Claude makes (`[T12] implement · Bash npm test`).
 `nightshift status` shows where the run is: the running step, for how long, its tool calls and the
 latest one, any wait, cost and usage, and whether the nightshift process is still alive.
+
+`nightshift watch` follows a run live from any terminal, whoever drives it (another terminal, a
+background service): the run's status and whether its process is alive, the current item, phase
+and PR, the running step with its elapsed time and a scrolling list of its latest tool calls, cost,
+5-hour and weekly usage bars (█ nightshift's points, ▓ the rest of the account, │ the `*_max`
+limit) with the reset times, any wait and when it ends, and the last ten events. It only reads
+files, so it never disturbs the run; it redraws about once a second and follows the next run when
+one starts. `q` or Ctrl-C quits and restores the terminal. Lines are cut to the terminal width,
+`NO_COLOR` turns colours off, and when the output is not a terminal (a pipe, a log file) it prints
+new events, tool calls and status changes line by line, like `tail -f`. `nightshift watch --once`
+prints one frame and exits.
 `nightshift stop` finishes the current step and stops. Configure `[notify] command` to get pinged
 on every stop (ntfy, `terminal-notifier`, Slack webhook…).
 
@@ -145,6 +156,8 @@ risk, and whether it needs a human (with the question a run would stop on).
   `extra_args` (`--permission-mode`, `--dangerously-skip-permissions`, `--allowedTools`, `--tools`,
   `--mcp-config`) do not apply to it. (Claude Code's `plan` permission mode is not used: it steers
   Claude into writing a plan file instead of answering.)
+- **Model.** `[agent.steps.plan]` sets its `model` and `max_turns` (see
+  [Models per step](#models-per-step)); otherwise `[agent]` applies.
 - **Budget and usage.** One plan costs at most `[budget] plan_usd` (default $2). With `[usage]`
   limits set, `plan` refuses to start at a limit instead of waiting; share limits count the current
   run's tally, and a plan's own usage is not added to it.
@@ -169,6 +182,9 @@ backend = "cli"              # "cli" (claude -p, default) or "sdk" (Claude Agent
 permission_mode = "auto"     # auto | acceptEdits | dontAsk | bypassPermissions
 max_turns = 200
 # add_dirs = [".."]          # let Claude work in sibling folders, e.g. git worktrees
+
+[agent.steps.implement]      # per-step overrides, see "Models per step" below
+model = "opus"
 
 [budget]
 item_usd = 25                # all Claude steps of one item together
@@ -269,6 +285,37 @@ The default prompts live in [`prompts/`](prompts). `nightshift init --eject-prom
 `.nightshift/prompts/` and points `[prompts] dir` at them; any file there overrides the default of the
 same name. Placeholders such as `{{pr_number}}` are checked: an unknown one is an error, not a blank.
 
+### Models per step
+
+`[agent.steps.<step>]` overrides `model`, `max_turns` and `permission_mode` for one step; anything it
+leaves out comes from `[agent]` (and with no `model` anywhere, Claude Code picks its default). The
+steps are `implement`, `address`, `fix_checks`, `resolve_conflicts` and `finalize`; any other name,
+key or value is a config error. `[agent.steps.plan]` sets `model` and `max_turns` for
+[`nightshift plan`](#previewing-the-next-items-nightshift-plan) (a cheap model is often enough);
+it takes no `permission_mode`, because a plan session is always read-only.
+
+```toml
+[agent]
+model = "sonnet"             # every step without its own model
+
+[agent.steps.implement]
+model = "opus"               # the hard part
+max_turns = 300
+
+[agent.steps.finalize]
+model = "haiku"
+max_turns = 50
+```
+
+The steps of an item still share one Claude session: a step on another model resumes it
+(`--resume` with `--model`), and Claude Code carries the conversation over to the new model. The
+prompt cache is per model, though, so the first turn after a switch reads the whole session
+uncached: switch where it pays off, not on every step.
+
+`nightshift doctor` lists each step's model (and any `max_turns`/`permission_mode` override), every
+step's log line names its model (`[T3] address · model sonnet · budget $24.10`), and the `agent`
+event in `events.jsonl` records it. Both backends apply the overrides.
+
 ### Backends
 
 - **`cli`** (default) runs `claude -p` with the prompt on stdin and `--output-format stream-json`. It
@@ -314,6 +361,8 @@ colleague push access for the night.
 ├── STOP                 # created by `nightshift stop`
 └── runs/<run-id>/
     ├── events.jsonl     # every transition, cost, usage and outcome
+    ├── progress.jsonl   # every tool call of every step, for `watch` (rotates at 256 KiB
+    │                    # to progress.1.jsonl, so at most about 512 KiB)
     └── item-<n>/        # each Claude step's streamed messages (.jsonl) and review log
 ```
 

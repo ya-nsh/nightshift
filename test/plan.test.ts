@@ -188,6 +188,30 @@ describe("plan: the read-only session", () => {
     expect(outcome.ok).toBe(true);
   });
 
+  it("runs with [agent.steps.plan] model and max_turns over [agent]", async () => {
+    const run = async (extra: string) => {
+      const { config, templates } = await setup(extra);
+      const agent = new FakeAgent([{ structured: { summary: "s", items: [] } }]);
+      await makePlan({ config, templates, agent, now: () => new Date() }, undefined, opts());
+      return agent.requests[0] as AgentRequest;
+    };
+    const plain = await run('[agent]\nmodel = "opus"\nmax_turns = 120');
+    expect(plain).toMatchObject({ model: "opus", maxTurns: 120 });
+    expect(plain.permissionMode).toBeUndefined();
+    const own = await run(
+      '[agent]\nmodel = "opus"\n[agent.steps.plan]\nmodel = "haiku"\nmax_turns = 30\n[agent.steps.implement]\nmodel = "sonnet"',
+    );
+    expect(own).toMatchObject({ model: "haiku", maxTurns: 30, readOnly: true });
+    const none = await run("");
+    expect(none).not.toHaveProperty("model");
+  });
+
+  it("does not accept a permission_mode for the plan step", async () => {
+    await expect(setup('[agent.steps.plan]\npermission_mode = "auto"')).rejects.toThrow(
+      /agent\.steps\.plan.*permission_mode/s,
+    );
+  });
+
   it("rejects results that break the schema", async () => {
     const { config, templates } = await setup();
     const bad = [
@@ -394,6 +418,16 @@ describe("plan: read-only agent settings", () => {
     expect(args).toContain("--add-dir=/other");
     expect(args.slice(-2)).toEqual(["--effort", "low"]);
     expect(args).not.toContain("--resume");
+    // A step permission mode on the request cannot widen a read-only session either.
+    const stepped = buildCliArgs(config.agent, { ...request, permissionMode: "bypassPermissions" });
+    expect(stepped[stepped.indexOf("--permission-mode") + 1]).toBe("dontAsk");
+    const sdk = buildSdkOptions(
+      config.agent,
+      { ...request, permissionMode: "bypassPermissions" },
+      new AbortController(),
+    );
+    expect(sdk.permissionMode).toBe("dontAsk");
+    expect(sdk).not.toHaveProperty("allowDangerouslySkipPermissions");
   });
 
   it("locks the SDK session down the same way", async () => {

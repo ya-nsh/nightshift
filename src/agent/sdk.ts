@@ -120,18 +120,21 @@ export function buildSdkOptions(
     : toSdkExtraArgs(config.extra_args);
   const executable = resolveClaudePath(config.claude_path);
   const addDirs = [...config.add_dirs, ...(request.addDirs ?? [])];
-  const permissionMode = readOnly ? READ_ONLY_PERMISSION_MODE : config.permission_mode;
+  const permissionMode = readOnly
+    ? READ_ONLY_PERMISSION_MODE
+    : (request.permissionMode ?? config.permission_mode);
+  const model = request.model ?? config.model;
   return {
     cwd: request.cwd,
     permissionMode,
     ...(permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
-    maxTurns: config.max_turns,
+    maxTurns: request.maxTurns ?? config.max_turns,
     maxBudgetUsd: request.maxBudgetUsd,
     outputFormat: { type: "json_schema", schema: request.schema },
     // Load the same settings, CLAUDE.md files and skills as the CLI does.
     settingSources: ["user", "project", "local"],
     abortController,
-    ...(config.model === undefined ? {} : { model: config.model }),
+    ...(model === undefined ? {} : { model }),
     ...(request.resumeSessionId === undefined ? {} : { resume: request.resumeSessionId }),
     ...(readOnly
       ? { allowedTools: [...READ_ONLY_TOOLS], disallowedTools: [...DENIED_TOOLS] }

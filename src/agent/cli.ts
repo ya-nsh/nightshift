@@ -68,6 +68,7 @@ export class ClaudeCliAgent implements Agent {
 
 export function buildCliArgs(config: AgentConfig, request: AgentRequest): string[] {
   const readOnly = request.readOnly === true;
+  const model = request.model ?? config.model;
   const args = [
     "-p",
     "--output-format",
@@ -76,13 +77,13 @@ export function buildCliArgs(config: AgentConfig, request: AgentRequest): string
     "--json-schema",
     JSON.stringify(request.schema),
     "--permission-mode",
-    readOnly ? READ_ONLY_PERMISSION_MODE : config.permission_mode,
+    readOnly ? READ_ONLY_PERMISSION_MODE : (request.permissionMode ?? config.permission_mode),
     "--max-turns",
-    String(config.max_turns),
+    String(request.maxTurns ?? config.max_turns),
     "--max-budget-usd",
     request.maxBudgetUsd.toFixed(2),
   ];
-  if (config.model !== undefined) args.push("--model", config.model);
+  if (model !== undefined) args.push("--model", model);
   if (request.resumeSessionId !== undefined) args.push("--resume", request.resumeSessionId);
   // Variadic flags use the `=` form so they cannot swallow the arguments that follow.
   if (readOnly) {
