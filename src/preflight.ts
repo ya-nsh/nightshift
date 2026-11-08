@@ -1,11 +1,14 @@
 import { accessSync, constants, existsSync } from "node:fs";
 import { statfs } from "node:fs/promises";
-import { loadSdkQuery } from "./agent/sdk.js";
+import path from "node:path";
+import { loadSdkQuery, resolveClaudePath, toSdkExtraArgs } from "./agent/sdk.js";
 import { type Config, expandHome } from "./config.js";
 import { exec, shellQuote } from "./exec.js";
+import { isActive, nextStart } from "./schedule.js";
 import {
   ClaudeUsageMeter,
   describeUsage,
+  formatTime,
   limitsEnabled,
   missingWindows,
   type UsageTally,
@@ -47,6 +50,22 @@ export async function preflight(
     } catch (error) {
       add("Agent SDK", false, (error as Error).message);
     }
+    try {
+      toSdkExtraArgs(config.agent.extra_args);
+      const executable = resolveClaudePath(config.agent.claude_path);
+      if (executable !== undefined && !isExecutable(executable)) {
+        throw new Error(`agent.claude_path: ${executable} is missing or not executable`);
+      }
+      add(
+        "Agent SDK options",
+        true,
+        executable === undefined
+          ? "uses the SDK's bundled Claude Code"
+          : `Claude Code at ${executable}`,
+      );
+    } catch (error) {
+      add("Agent SDK options", false, (error as Error).message);
+    }
   }
 
   for (const [alias, dir] of Object.entries(config.repos)) {
@@ -75,19 +94,38 @@ export async function preflight(
   } else {
     const program = expandHome(command.split(/\s+/)[0] ?? "");
     if (program.includes("/")) {
-      let ok = existsSync(program);
-      if (ok) {
-        try {
-          accessSync(program, constants.X_OK);
-        } catch {
-          ok = false;
-        }
-      }
-      add("review command", ok, ok ? program : `${program} is missing or not executable`);
+      // The command runs in each repo, so a relative path is looked up there.
+      const places = path.isAbsolute(program)
+        ? [program]
+        : Object.values(config.repos).map((dir) => path.resolve(dir, program));
+      const missing = places.filter((file) => !isExecutable(file));
+      add(
+        "review command",
+        missing.length === 0,
+        missing.length === 0
+          ? places.length === 1
+            ? (places[0] ?? program)
+            : `${program} (found in every repo)`
+          : `${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing or not executable`,
+      );
     } else {
       const found = await run("/bin/sh", ["-c", `command -v ${shellQuote(program)}`]);
       add("review command", found.ok, found.ok ? found.out.trim() : `${program} not found on PATH`);
     }
+  }
+
+  const { active_hours: hours } = config.schedule;
+  if (hours.length > 0) {
+    const now = new Date();
+    add(
+      "active hours",
+      true,
+      `${hours.map((r) => r.text).join(", ")} local time · ${
+        isActive(hours, now)
+          ? "inside them now"
+          : `outside now; Claude work starts ${formatTime(nextStart(hours, now).toISOString(), now)}`
+      }`,
+    );
   }
 
   const limits = usageLimits(config.usage, usage.share);
@@ -139,4 +177,13 @@ async function run(
 
 function firstLine(text: string): string {
   return text.split("\n")[0] ?? "";
+}
+
+function isExecutable(file: string): boolean {
+  try {
+    accessSync(file, constants.X_OK);
+    return existsSync(file);
+  } catch {
+    return false;
+  }
 }

@@ -13,6 +13,8 @@ const PR_FIELDS = [
   "mergeable",
   "mergeCommit",
   "statusCheckRollup",
+  "reviewDecision",
+  "mergeStateStatus",
 ].join(",");
 
 /** GitHub through the `gh` CLI, so it uses whatever account `gh auth login` set up. */
@@ -35,6 +37,7 @@ export class GhForge implements Forge {
     number: number,
     method: "merge" | "rebase" | "squash",
     headSha: string,
+    options: { auto?: boolean } = {},
   ): Promise<void> {
     // No --delete-branch: with it gh also edits the local checkout. The branch is deleted via the API.
     await this.gh([
@@ -44,6 +47,7 @@ export class GhForge implements Forge {
       "-R",
       repoSlug,
       `--${method}`,
+      ...(options.auto ? ["--auto"] : []),
       "--match-head-commit",
       headSha,
     ]);
@@ -89,6 +93,12 @@ export function toPullRequest(json: Record<string, unknown>): PullRequest {
       : "UNKNOWN") as Mergeable,
     mergeCommitSha: typeof mergeCommit?.oid === "string" ? mergeCommit.oid : undefined,
     checks: summarizeChecks(Array.isArray(json.statusCheckRollup) ? json.statusCheckRollup : []),
+    ...(typeof json.reviewDecision === "string" && json.reviewDecision !== ""
+      ? { reviewDecision: json.reviewDecision }
+      : {}),
+    ...(typeof json.mergeStateStatus === "string"
+      ? { mergeStateStatus: json.mergeStateStatus }
+      : {}),
   };
 }
 

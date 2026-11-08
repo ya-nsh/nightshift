@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { UsageWindows } from "./ports.js";
-import type { UsageTally } from "./usage.js";
+import type { UsageTally, UsageWindow } from "./usage.js";
 
 export const PHASES = [
   "implement",
@@ -54,6 +55,14 @@ export interface ItemState {
   pendingQuestion?: string;
   pendingAnswer?: string;
   costUsd: number;
+  /** Percentage points of each usage window this item's steps used (when usage is measured). */
+  usagePoints?: Partial<Record<UsageWindow, number>>;
+  /** The Claude step running right now, for `status`. */
+  activity?: { step: string; since: string; tools: number; last?: string; lastAt?: string };
+  /** Head commit auto-merge was enabled for (merge.when_blocked = "auto"). */
+  autoMergeSha?: string;
+  /** The bounded loop whose cap halted the run; `resume` grants that loop fresh rounds. */
+  capHit?: "fix_checks" | "resolve_conflicts";
 }
 
 export interface RunState {
@@ -68,16 +77,17 @@ export interface RunState {
   /** `--usage-share` given to `run` or `resume`; overrides `[usage] session_share` for this run. */
   usageShare?: number;
   usage?: UsageState;
+  /** Set while the run sleeps: for a usage window to reset, or for its active hours. */
+  waiting?: { until: string; reason: string };
 }
 
 export interface UsageState {
   /** Points of each window that nightshift's own steps used. */
   tally: UsageTally;
+  /** Points nightshift used over the whole run, across window resets. */
+  points?: Partial<Record<UsageWindow, number>>;
   /** The latest reading, for `status`. */
   last?: { at: string; windows: UsageWindows };
-  /** Set while the run waits for a usage window to reset. */
-  waitingUntil?: string;
-  waitingFor?: string;
 }
 
 export function newRunId(now: Date): string {
@@ -87,6 +97,9 @@ export function newRunId(now: Date): string {
 
 /** Persists run state atomically and keeps an append-only event journal per run. */
 export class StateStore {
+  /** Saves run one after another: a usage check and progress updates may save during a step. */
+  private saving: Promise<void> = Promise.resolve();
+
   constructor(readonly dir: string) {}
 
   get statePath(): string {
@@ -110,11 +123,17 @@ export class StateStore {
     return state;
   }
 
-  async save(state: RunState): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
-    const tmp = `${this.statePath}.${process.pid}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`);
-    await rename(tmp, this.statePath);
+  save(state: RunState): Promise<void> {
+    // Serialize now, so the file holds the state as it was when save() was called.
+    const text = `${JSON.stringify(state, null, 2)}\n`;
+    const next = this.saving.then(async () => {
+      await mkdir(this.dir, { recursive: true });
+      const tmp = `${this.statePath}.${process.pid}.tmp`;
+      await writeFile(tmp, text);
+      await rename(tmp, this.statePath);
+    });
+    this.saving = next.catch(() => {});
+    return next;
   }
 
   /** Moves the current state into its run directory so a new run can start. */
@@ -130,6 +149,22 @@ export class StateStore {
     const line = JSON.stringify({ at: new Date().toISOString(), ...event });
     await appendFile(path.join(dir, "events.jsonl"), `${line}\n`);
   }
+}
+
+export class LockedError extends Error {
+  override name = "LockedError";
+}
+
+/** The pid holding the lock in `dir`, if that process is alive. */
+export function lockHolder(dir: string): number | undefined {
+  let text: string;
+  try {
+    text = readFileSync(path.join(dir, "lock"), "utf8");
+  } catch {
+    return undefined;
+  }
+  const pid = Number(text.trim());
+  return Number.isInteger(pid) && pid > 0 && isAlive(pid) ? pid : undefined;
 }
 
 /** A pid lock so two nightshift processes never drive the same state. */
@@ -149,7 +184,9 @@ export class Lock {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const pid = Number((await readFile(file, "utf8").catch(() => "")).trim());
         if (Number.isInteger(pid) && pid > 0 && isAlive(pid)) {
-          throw new Error(`another nightshift process (pid ${pid}) is running in ${dir}`);
+          throw new LockedError(
+            `another nightshift process (pid ${pid}) is already driving this run; \`nightshift status\` shows what it is doing, \`nightshift stop\` stops it after the current step`,
+          );
         }
         await rm(file, { force: true }); // stale lock from a crashed process
       }

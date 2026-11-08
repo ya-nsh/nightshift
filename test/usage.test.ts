@@ -279,7 +279,7 @@ describe("pipeline with a usage budget", () => {
     expect(h.host.logs.some((l) => l.includes("waiting until"))).toBe(true);
     expect(agent.requests[3]?.prompt).toContain("do task two");
     expect(state.usage?.tally.five_hour?.used).toBe(18);
-    expect(state.usage?.waitingUntil).toBeUndefined();
+    expect(state.waiting).toBeUndefined();
     const events = await readFile(path.join(h.store.runDir("run-1"), "events.jsonl"), "utf8");
     expect(events).toContain('"type":"usage_wait"');
     expect(events).toContain('"type":"usage","item":1,"step":"implement","points":{"five_hour":6');

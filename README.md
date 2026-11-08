@@ -91,7 +91,7 @@ merges. See [`examples/api-and-app`](examples/api-and-app) for a two-repo setup.
 | *(re-review)* | | If fixes were pushed, review again, up to `review.max_rounds` | |
 | checks | nightshift | Polls CI; a PR with no CI merges after `settle_seconds` | CI keeps failing, times out, or the PR closed |
 | fix checks | Claude, resumed | Reads failed logs, fixes the root cause, pushes | after `checks.max_fix_rounds` |
-| merge | nightshift | Waits for mergeability, merges pinned to the checked SHA, deletes the branch | branch protection or anything else rejects it |
+| merge | nightshift | Waits for mergeability, merges pinned to the checked SHA, deletes the branch | branch protection needs an approval (or, with `when_blocked = "auto"`, waits for auto-merge), or anything else rejects it |
 | resolve conflicts | Claude, resumed | Merges the base branch in, resolves, pushes | after `merge.max_conflict_rounds` |
 | finalize | Claude, resumed | Post-merge steps, picks the next task, writes `next_prompt` and `next_repo` | it needs you, or nothing is left |
 
@@ -107,11 +107,19 @@ run; it never steers it.
 | Item limit reached (`--once`, `--max-items`, `limits.max_items`) or `nightshift stop` | 0 | `nightshift resume` |
 | Usage limit reached with `on_limit = "halt"` (with `"wait"` it sleeps until the window resets) | 0 | `nightshift resume` after the reset |
 | Claude needs a human | 2 | `nightshift resume --answer "…"`: the answer goes into the same session (or into the next item's prompt) |
+| Outside `[schedule] active_hours` with `outside_hours = "halt"` | 0 | `nightshift resume` |
 | Something failed (budget, CI, merge, review, disk, agent error) | 3 | fix the cause, then `nightshift resume` |
 | Ctrl-C | 130 | `nightshift resume` (the interrupted step restarts, and Claude is told to check what it already did) |
 
-`nightshift status` shows where the run is; `nightshift stop` finishes the current step and stops.
-Configure `[notify] command` to get pinged on every stop (ntfy, `terminal-notifier`, Slack webhook…).
+`nightshift resume` is a human saying "try again": an answer you gave is kept until the step it
+was meant for succeeds, a loop that hit its cap (CI fix rounds, conflict rounds) gets its rounds
+back, and a checks timeout starts over.
+
+While a step runs, nightshift logs each tool call Claude makes (`[T12] implement · Bash npm test`).
+`nightshift status` shows where the run is: the running step, for how long, its tool calls and the
+latest one, any wait, cost and usage, and whether the nightshift process is still alive.
+`nightshift stop` finishes the current step and stops. Configure `[notify] command` to get pinged
+on every stop (ntfy, `terminal-notifier`, Slack webhook…).
 
 ## Configuration
 
@@ -147,9 +155,13 @@ max_fix_rounds = 2
 
 [merge]
 method = "merge"             # merge | rebase | squash
+when_blocked = "halt"        # a required approval blocks the merge: "halt", or "auto" (auto-merge)
+
+[schedule]
+active_hours = ["23:00-07:00"]   # start Claude work only in these local-time ranges
 
 [limits]
-max_items = 0                # 0 = until done or stopped
+max_items = 0                # 0 = until done or stopped (`--max-items 0` also means no limit)
 min_free_disk_gb = 0
 ```
 
@@ -185,7 +197,24 @@ How it works:
   runs no model turn and costs nothing, but it is not a documented API. If it can't be read while
   limits are set, nightshift halts rather than running unmetered. `nightshift doctor` shows the
   current numbers, and `nightshift status` shows the last reading and any wait.
+- Claude's stream also reports usage (`rate_limit_event`), which updates the tally between checks,
+  so a step crossing a limit is stopped sooner and fewer checks are needed.
+- Points used are tracked per item and per run: `status` and the end-of-run summary show them.
 - API-key logins have no usage windows; use `[budget]` there.
+
+### Active hours
+
+`[schedule] active_hours` (one range or a list, local time, may cross midnight) limits when Claude
+work starts: outside them nightshift waits for the next range (`outside_hours = "wait"`, the
+default) or pauses (`"halt"`). A step that is already running finishes; CI waits and merges carry on
+at any time. Combine it with `[usage]` to run only overnight, on a share of your plan.
+
+### Branch protection
+
+nightshift merges the PR itself, so a rule that requires an approving review blocks it. By default
+it halts and says so: approve the PR (or merge it yourself), then `nightshift resume`. With
+`merge.when_blocked = "auto"` it enables GitHub auto-merge for the checked commit instead and waits
+for GitHub to merge once the PR is approved (the repo must allow auto-merge).
 
 ### Review
 
@@ -207,12 +236,17 @@ same name. Placeholders such as `{{pr_number}}` are checked: an unknown one is a
 
 ### Backends
 
-- **`cli`** (default) runs `claude -p` with the prompt on stdin and `--output-format json`. It uses
-  your existing Claude Code login, settings, `CLAUDE.md` files, skills and plugins.
+- **`cli`** (default) runs `claude -p` with the prompt on stdin and `--output-format stream-json`. It
+  uses your existing Claude Code login, settings, `CLAUDE.md` files, skills and plugins.
 - **`sdk`** runs the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)'s
   `query()` with the same options and `settingSources: ["user", "project", "local"]`. Install
-  `@anthropic-ai/claude-agent-sdk` next to nightshift or in your project. It authenticates however the
-  SDK is configured to (see its docs).
+  `@anthropic-ai/claude-agent-sdk` next to nightshift or in your project. `extra_args` are passed as
+  the SDK's `extraArgs`, and a `claude_path` other than `claude` as `pathToClaudeCodeExecutable`
+  (otherwise the SDK's bundled Claude Code runs). It authenticates however the SDK is configured to
+  (see its docs).
+
+Stopping a step (Ctrl-C, a usage limit) asks Claude to stop (SIGINT, or the SDK's `interrupt()`), so
+the cost it reports so far is still counted.
 
 ## Safety
 
@@ -244,8 +278,8 @@ colleague push access for the night.
 ├── lock                 # pid lock: one nightshift per state
 ├── STOP                 # created by `nightshift stop`
 └── runs/<run-id>/
-    ├── events.jsonl     # every transition, cost and outcome
-    └── item-<n>/        # each Claude result and review log
+    ├── events.jsonl     # every transition, cost, usage and outcome
+    └── item-<n>/        # each Claude step's streamed messages (.jsonl) and review log
 ```
 
 ## Development
@@ -256,11 +290,25 @@ npm run check    # typecheck, lint (Biome), tests (Vitest)
 npm run build
 ```
 
-The pipeline is tested end to end against in-memory fakes of Claude, GitHub, the reviewer and the
-clock (`test/fakes.ts`), so it is cheap to cover new paths. The CLI backend is also tested against a
-fake `claude` executable. It was checked once against the real `claude` CLI (structured output,
-`--resume`, `--allowedTools=` / `--add-dir=`). The SDK backend has not yet been run against the real
-SDK; it is covered only by unit tests with a fake `query()`.
+The pipeline is tested end to end against in-memory fakes of Claude, GitHub, the reviewer, the
+clock and the plan's usage (`test/fakes.ts`), so it is cheap to cover new paths. The CLI backend is
+also tested against fake `claude` executables. Both backends were checked against the real thing
+(Claude Code 2.1.283 and `@anthropic-ai/claude-agent-sdk` 0.3.319): structured output, streamed tool
+calls and usage, and stopping a step with its cost reported.
+
+### Releasing
+
+Bump `version` in `package.json` and add a `CHANGELOG.md` entry in a PR. Once it is merged, tag
+`main`; the [release workflow](.github/workflows/release.yml) checks the tag against
+`package.json`, runs the checks, publishes to npm with trusted publishing (no token, no 2FA prompt)
+and creates a GitHub release from the changelog:
+
+```bash
+git fetch origin && git tag v0.3.0 origin/main && git push origin v0.3.0
+```
+
+Trusted publishing needs a one-time setup on npmjs.com: the package's Settings → Trusted Publisher
+→ GitHub Actions, repository `ya-nsh/nightshift`, workflow `release.yml`.
 
 ## License
 

@@ -13,7 +13,7 @@ import { type Exit, newRunState, Pipeline } from "./pipeline.js";
 import type { Agent } from "./ports.js";
 import { preflight } from "./preflight.js";
 import { ShellReviewer } from "./reviewer.js";
-import { Lock, newRunId, type RunState, StateStore } from "./state.js";
+import { Lock, LockedError, lockHolder, newRunId, type RunState, StateStore } from "./state.js";
 import { loadTemplates } from "./templates.js";
 import {
   ClaudeUsageMeter,
@@ -21,6 +21,7 @@ import {
   formatTime,
   limitsEnabled,
   type UsageTally,
+  type UsageWindow,
   usageLimits,
 } from "./usage.js";
 
@@ -48,6 +49,8 @@ Options:
   --usage-share PCT
                   let this run use at most PCT points of each 5-hour Claude usage window
                   (overrides [usage] session_share; kept for later resumes; 0 = no share limit)
+  --max-items N   stop after N completed items in this invocation (0 = no limit; overrides
+                  [limits] max_items)
   -h, --help      show this help
   -v, --version   show the version
 
@@ -227,7 +230,7 @@ function printExit(exit: Exit): void {
   const lines = [
     "",
     `${exit.kind.toUpperCase()}: ${exit.reason}`,
-    `items completed: ${state.itemsCompleted} · total cost: $${state.costUsd.toFixed(2)}`,
+    `items completed: ${state.itemsCompleted} · total cost: $${state.costUsd.toFixed(2)}${formatPoints(state.usage?.points)}`,
   ];
   if (state.item?.pr) lines.push(`current PR: ${state.item.pr.url}`);
   if (exit.kind === "blocked") lines.push('answer and continue: nightshift resume --answer "…"');
@@ -258,35 +261,63 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
     console.log("no run yet");
     return 0;
   }
+  const now = new Date();
+  const holder = lockHolder(config.dir);
+  const running =
+    state.status === "running"
+      ? holder === undefined
+        ? "running according to state.json, but no nightshift process holds the lock (it was killed); `nightshift resume` continues"
+        : `running (pid ${holder})`
+      : state.status;
   const item = state.item;
   const lines = [
-    `run ${state.runId} · ${state.status}${state.haltReason ? ` (${state.haltReason})` : ""}`,
-    `started ${state.startedAt} · items completed ${state.itemsCompleted} · cost $${state.costUsd.toFixed(2)}`,
+    `run ${state.runId} · ${running}${state.haltReason ? ` (${state.haltReason})` : ""}`,
+    `started ${formatTime(state.startedAt, now)} · items completed ${state.itemsCompleted} · cost $${state.costUsd.toFixed(2)}${formatPoints(state.usage?.points)}`,
   ];
   if (item) {
     lines.push(
-      `item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}`,
+      `item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}${formatPoints(item.usagePoints)}`,
     );
     if (item.pr) lines.push(`PR ${item.pr.url}`);
+    const activity = item.activity;
+    if (activity && holder !== undefined) {
+      const last =
+        activity.last === undefined
+          ? ""
+          : ` · last: ${activity.last} (${ago(activity.lastAt ?? activity.since, now)} ago)`;
+      lines.push(
+        `step ${activity.step} running for ${ago(activity.since, now)} · ${activity.tools} tool call(s)${last}`,
+      );
+    }
     if (item.pendingQuestion) lines.push(`waiting for an answer: ${item.pendingQuestion}`);
+  }
+  if (state.waiting !== undefined && holder !== undefined) {
+    lines.push(`waiting until ${formatTime(state.waiting.until, now)}: ${state.waiting.reason}`);
   }
   const limits = usageLimits(config.usage, state.usageShare);
   const usage = state.usage;
   if (usage?.last !== undefined) {
-    const now = new Date();
     lines.push(
       `usage at ${formatTime(usage.last.at, now)}: ${describeUsage(usage.last.windows, usage.tally, limits, now)}`,
     );
   } else if (limitsEnabled(limits)) {
     lines.push("usage: not read yet");
   }
-  if (usage?.waitingUntil !== undefined) {
-    lines.push(
-      `waiting until ${formatTime(usage.waitingUntil, new Date())}: ${usage.waitingFor ?? "usage limit"}`,
-    );
-  }
   console.log(lines.join("\n"));
   return 0;
+}
+
+function formatPoints(points: Partial<Record<UsageWindow, number>> | undefined): string {
+  const five = points?.five_hour;
+  return five === undefined || five <= 0 ? "" : ` · ${five} points of 5-hour usage`;
+}
+
+function ago(iso: string, now: Date): string {
+  const seconds = Math.max(0, Math.round((now.getTime() - Date.parse(iso)) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 async function readPrompt(
@@ -337,6 +368,7 @@ main(process.argv.slice(2)).then(
     const known =
       error instanceof UsageError ||
       error instanceof ConfigError ||
+      error instanceof LockedError ||
       String((error as { code?: unknown }).code ?? "").startsWith("ERR_PARSE_ARGS");
     console.error(
       `nightshift: ${known ? (error as Error).message : ((error as Error).stack ?? String(error))}`,
