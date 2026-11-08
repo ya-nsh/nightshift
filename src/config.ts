@@ -12,6 +12,9 @@ const repoAlias = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/, "repo aliases use letters, digits, '.', '_' or '-'");
 
+/** A percentage of a usage window, 0–100 (0 = no limit). */
+const percent = z.number().min(0).max(100);
+
 export const PERMISSION_MODES = ["auto", "acceptEdits", "dontAsk", "bypassPermissions"] as const;
 export const MERGE_METHODS = ["merge", "rebase", "squash"] as const;
 
@@ -67,6 +70,16 @@ const configSchema = z.strictObject({
     .strictObject({
       max_items: z.number().int().min(0).default(0),
       min_free_disk_gb: z.number().min(0).default(0),
+    })
+    .prefault({}),
+  usage: z
+    .strictObject({
+      session_share: percent.default(0),
+      session_max: percent.default(0),
+      weekly_share: percent.default(0),
+      weekly_max: percent.default(0),
+      on_limit: z.enum(["wait", "halt"]).default("wait"),
+      check_seconds: z.number().int().min(10).max(3600).default(60),
     })
     .prefault({}),
   notify: z.strictObject({ command: z.string().default("") }).prefault({}),

@@ -15,6 +15,14 @@ import { preflight } from "./preflight.js";
 import { ShellReviewer } from "./reviewer.js";
 import { Lock, newRunId, type RunState, StateStore } from "./state.js";
 import { loadTemplates } from "./templates.js";
+import {
+  ClaudeUsageMeter,
+  describeUsage,
+  formatTime,
+  limitsEnabled,
+  type UsageTally,
+  usageLimits,
+} from "./usage.js";
 
 const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -27,15 +35,19 @@ const HELP = `nightshift ${VERSION} — let Claude Code work through your todo l
 Usage:
   nightshift init [--eject-prompts]          create .nightshift/config.toml here
   nightshift doctor                          check gh, claude, repos, review command, disk
-  nightshift run (--prompt TEXT | --prompt-file FILE) [--repo ALIAS] [--once] [--max-items N] [--force]
+  nightshift run (--prompt TEXT | --prompt-file FILE) [--repo ALIAS] [--once] [--max-items N]
+                 [--usage-share PCT] [--force]
                                              start a run with the first item's prompt
-  nightshift resume [--answer TEXT] [--once] [--max-items N]
+  nightshift resume [--answer TEXT] [--once] [--max-items N] [--usage-share PCT]
                                              continue a halted or paused run
   nightshift status [--json]                 show the current run
   nightshift stop                            stop gracefully after the current step
 
 Options:
   --config FILE   use this config instead of the nearest .nightshift/config.toml
+  --usage-share PCT
+                  let this run use at most PCT points of each 5-hour Claude usage window
+                  (overrides [usage] session_share; kept for later resumes; 0 = no share limit)
   -h, --help      show this help
   -v, --version   show the version
 
@@ -56,6 +68,7 @@ async function main(argv: string[]): Promise<number> {
       repo: { type: "string" },
       once: { type: "boolean", default: false },
       "max-items": { type: "string" },
+      "usage-share": { type: "string" },
       force: { type: "boolean", default: false },
       answer: { type: "string" },
       json: { type: "boolean", default: false },
@@ -88,12 +101,22 @@ async function main(argv: string[]): Promise<number> {
   const config = await loadConfig(values.config, cwd);
   const store = new StateStore(config.dir);
   const maxItems = values.once ? 1 : parseMaxItems(values["max-items"]);
+  const usageShare = parseUsageShare(values["usage-share"]);
 
   switch (command) {
-    case "doctor":
-      return (await doctor(config)) ? 0 : 1;
+    case "doctor": {
+      const state = await store.load();
+      const live = state !== undefined && state.status !== "done";
+      return (await doctor(
+        config,
+        usageShare ?? (live ? state.usageShare : undefined),
+        live ? state.usage?.tally : undefined,
+      ))
+        ? 0
+        : 1;
+    }
     case "status":
-      return status(await store.load(), values.json);
+      return status(await store.load(), values.json, config);
     case "stop":
       await writeFile(path.join(config.dir, STOP_FILE), `${new Date().toISOString()}\n`);
       console.log("nightshift will stop after the current step");
@@ -115,10 +138,11 @@ async function main(argv: string[]): Promise<number> {
             );
           }
         }
-        if (!(await doctor(config))) return 1;
+        if (!(await doctor(config, usageShare, undefined))) return 1;
         if (existing) await store.archive(existing);
         const now = new Date();
         const state = newRunState(newRunId(now), now, repo, prompt);
+        if (usageShare !== undefined) state.usageShare = usageShare;
         await store.save(state);
         return drive(config, store, state, maxItems, undefined);
       });
@@ -132,7 +156,11 @@ async function main(argv: string[]): Promise<number> {
           console.log(`run ${state.runId} is done: ${state.haltReason ?? ""}`);
           return 0;
         }
-        if (!(await doctor(config))) return 1;
+        if (usageShare !== undefined) {
+          state.usageShare = usageShare;
+          await store.save(state);
+        }
+        if (!(await doctor(config, state.usageShare, state.usage?.tally))) return 1;
         return drive(config, store, state, maxItems, values.answer);
       });
     default:
@@ -161,6 +189,7 @@ async function drive(
       reviewer: new ShellReviewer(),
       host,
       store,
+      usage: new ClaudeUsageMeter(config.agent.claude_path, config.home),
     },
     state,
   );
@@ -206,14 +235,21 @@ function printExit(exit: Exit): void {
   console.log(lines.join("\n"));
 }
 
-async function doctor(config: Config): Promise<boolean> {
-  const checks = await preflight(config);
+async function doctor(
+  config: Config,
+  share: number | undefined,
+  tally: UsageTally | undefined,
+): Promise<boolean> {
+  const checks = await preflight(config, {
+    ...(share === undefined ? {} : { share }),
+    ...(tally === undefined ? {} : { tally }),
+  });
   for (const check of checks)
     console.error(`${check.ok ? "✓" : "✗"} ${check.name}: ${check.detail}`);
   return checks.every((check) => check.ok);
 }
 
-function status(state: RunState | undefined, json: boolean): number {
+function status(state: RunState | undefined, json: boolean, config: Config): number {
   if (json) {
     console.log(JSON.stringify(state ?? null, null, 2));
     return 0;
@@ -233,6 +269,21 @@ function status(state: RunState | undefined, json: boolean): number {
     );
     if (item.pr) lines.push(`PR ${item.pr.url}`);
     if (item.pendingQuestion) lines.push(`waiting for an answer: ${item.pendingQuestion}`);
+  }
+  const limits = usageLimits(config.usage, state.usageShare);
+  const usage = state.usage;
+  if (usage?.last !== undefined) {
+    const now = new Date();
+    lines.push(
+      `usage at ${formatTime(usage.last.at, now)}: ${describeUsage(usage.last.windows, usage.tally, limits, now)}`,
+    );
+  } else if (limitsEnabled(limits)) {
+    lines.push("usage: not read yet");
+  }
+  if (usage?.waitingUntil !== undefined) {
+    lines.push(
+      `waiting until ${formatTime(usage.waitingUntil, new Date())}: ${usage.waitingFor ?? "usage limit"}`,
+    );
   }
   console.log(lines.join("\n"));
   return 0;
@@ -255,6 +306,15 @@ function parseMaxItems(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) throw new UsageError("--max-items must be a whole number ≥ 0");
+  return n;
+}
+
+function parseUsageShare(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value.trim().replace(/%$/, ""));
+  if (value.trim() === "" || !Number.isFinite(n) || n < 0 || n > 100) {
+    throw new UsageError("--usage-share must be a percentage from 0 to 100");
+  }
   return n;
 }
 

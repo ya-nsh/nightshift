@@ -61,6 +61,19 @@ max_conflict_rounds = 2
 max_items = 0                     # items per invocation; 0 = until done or halted
 min_free_disk_gb = 0              # halt before a step when free disk drops below this
 
+[usage]
+# Claude subscription limits, read from Claude Code (5-hour "session" window and weekly window).
+# *_share: percentage points of each window nightshift itself may use (only what changes while its
+#          own steps run counts, not your interactive sessions). \`--usage-share 15\` sets session_share.
+# *_max:   don't let the account's total go past this % (leaves headroom for you). 0 = no limit.
+session_share = 0
+session_max = 0
+weekly_share = 0
+weekly_max = 0
+on_limit = "wait"                 # "wait" for the window to reset, or "halt" (pause; resume later)
+check_seconds = 60                # how often usage is re-read while a step runs; a step that
+                                  # crosses a limit is stopped and restarted after the reset
+
 [notify]
 # Runs on halt/finish with NIGHTSHIFT_EVENT, _KIND, _REASON, _ITEM, _PR, _COST, _RUN in the environment.
 command = ""

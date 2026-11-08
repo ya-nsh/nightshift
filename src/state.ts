@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { UsageWindows } from "./ports.js";
+import type { UsageTally } from "./usage.js";
 
 export const PHASES = [
   "implement",
@@ -34,6 +36,8 @@ export interface ItemState {
   phase: Phase;
   /** Set while a phase is executing; still set on startup means the last attempt was interrupted. */
   inFlight?: Phase;
+  /** A Claude step that the usage limit stopped part-way; it restarts with the "restarted" prompt. */
+  interruptedPhase?: Phase;
   sessionId?: string;
   pr?: { number: number; url: string; repoSlug: string; branch: string };
   reviewRound: number;
@@ -61,6 +65,19 @@ export interface RunState {
   itemsCompleted: number;
   costUsd: number;
   item?: ItemState;
+  /** `--usage-share` given to `run` or `resume`; overrides `[usage] session_share` for this run. */
+  usageShare?: number;
+  usage?: UsageState;
+}
+
+export interface UsageState {
+  /** Points of each window that nightshift's own steps used. */
+  tally: UsageTally;
+  /** The latest reading, for `status`. */
+  last?: { at: string; windows: UsageWindows };
+  /** Set while the run waits for a usage window to reset. */
+  waitingUntil?: string;
+  waitingFor?: string;
 }
 
 export function newRunId(now: Date): string {
