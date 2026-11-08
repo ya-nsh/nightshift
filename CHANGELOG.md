@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **GitHub issues as the task source.** `[tasks] source = "github_issues"` takes each item from the
+  open issues labelled `[tasks] label` (default `nightshift`) instead of from Claude's handoff:
+  oldest first, after any `priority_labels`; issues assigned to someone else, labelled with a
+  `skip_labels` entry, already claimed or opened by someone outside `authors` are skipped.
+  nightshift claims the issue (assignee and `in_progress_label`), builds the implement prompt from
+  it (new `issue` template, asking for `Closes #N`), and after the merge makes sure the issue is
+  closed, closing it with a comment linking the PR when GitHub did not. The finalize step then only
+  does post-merge work (new `finalize-issue` template; no `next_prompt`), and the run finishes when
+  no issue is left. A stop that needs a human comments on the issue and adds `blocked_label`;
+  `resume` removes the label, and `run --force` releases the claim. `nightshift run` needs no
+  `--prompt` with this source (one given adds instructions to every issue), and `doctor` and
+  `status` show the task source and the next issue.
+
 ## 0.3.0 — 2026-11-08
 
 ### Added

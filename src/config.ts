@@ -16,6 +16,19 @@ const repoAlias = z
 /** A percentage of a usage window, 0–100 (0 = no limit). */
 const percent = z.number().min(0).max(100);
 
+/** A GitHub label name; `gh` splits flag values on commas, so those are not allowed. */
+const labelName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(50)
+  .refine((name) => !name.includes(","), "label names cannot contain commas");
+/** A label nightshift manages, or "" for none. */
+const optionalLabel = z.union([z.literal(""), labelName]);
+
+export const TASK_SOURCES = ["handoff", "github_issues"] as const;
+export type TaskSource = (typeof TASK_SOURCES)[number];
+
 export const PERMISSION_MODES = ["auto", "acceptEdits", "dontAsk", "bypassPermissions"] as const;
 export const MERGE_METHODS = ["merge", "rebase", "squash"] as const;
 
@@ -101,6 +114,19 @@ const configSchema = z.strictObject({
       outside_hours: z.enum(["wait", "halt"]).default("wait"),
     })
     .prefault({}),
+  tasks: z
+    .strictObject({
+      source: z.enum(TASK_SOURCES).default("handoff"),
+      label: labelName.default("nightshift"),
+      repo: repoAlias.optional(),
+      priority_labels: z.array(labelName).default([]),
+      skip_labels: z.array(labelName).default(["blocked"]),
+      authors: z.array(z.string().trim().min(1)).default([]),
+      assign: z.boolean().default(true),
+      in_progress_label: optionalLabel.default("nightshift-in-progress"),
+      blocked_label: optionalLabel.default("nightshift-blocked"),
+    })
+    .prefault({}),
   notify: z.strictObject({ command: z.string().default("") }).prefault({}),
   prompts: z.strictObject({ dir: z.string().min(1).optional() }).prefault({}),
 });
@@ -108,7 +134,7 @@ const configSchema = z.strictObject({
 export type RawConfig = z.infer<typeof configSchema>;
 
 /** Validated config with every path made absolute. */
-export interface Config extends Omit<RawConfig, "repos" | "default_repo"> {
+export interface Config extends Omit<RawConfig, "repos" | "default_repo" | "tasks"> {
   /** Directory containing `.nightshift/`; relative paths in the config resolve against it. */
   home: string;
   /** `<home>/.nightshift` */
@@ -116,6 +142,8 @@ export interface Config extends Omit<RawConfig, "repos" | "default_repo"> {
   repos: Record<string, string>;
   defaultRepo: string;
   promptsDir: string | undefined;
+  /** `[tasks]`, with `repo` resolved to an alias (default: `defaultRepo`). */
+  tasks: Omit<RawConfig["tasks"], "repo"> & { repo: string };
 }
 
 export class ConfigError extends Error {
@@ -144,6 +172,13 @@ export function parseConfig(text: string, home: string): Config {
       `default_repo "${raw.default_repo}" is not one of: ${aliases.join(", ")}`,
     );
   }
+  const tasks = { ...raw.tasks, repo: raw.tasks.repo ?? defaultRepo };
+  const taskIssues = validateTasks(tasks, aliases);
+  if (taskIssues.length > 0) {
+    throw new ConfigError(
+      `invalid config:\n${taskIssues.map((i) => `  - tasks: ${i}`).join("\n")}`,
+    );
+  }
   const resolve = (p: string) => path.resolve(home, expandHome(p));
   const { repos: _repos, default_repo: _default, ...rest } = raw;
   return {
@@ -160,7 +195,33 @@ export function parseConfig(text: string, home: string): Config {
     repos: Object.fromEntries(Object.entries(raw.repos).map(([alias, p]) => [alias, resolve(p)])),
     defaultRepo,
     promptsDir: raw.prompts.dir === undefined ? undefined : resolve(raw.prompts.dir),
+    tasks,
   };
+}
+
+function validateTasks(tasks: Config["tasks"], aliases: string[]): string[] {
+  const issues: string[] = [];
+  if (!aliases.includes(tasks.repo)) {
+    issues.push(`repo "${tasks.repo}" is not one of: ${aliases.join(", ")}`);
+  }
+  const managed = {
+    in_progress_label: tasks.in_progress_label,
+    blocked_label: tasks.blocked_label,
+  };
+  for (const [key, name] of Object.entries(managed)) {
+    if (name === "") continue;
+    if (name === tasks.label) issues.push(`${key} must differ from label ("${name}")`);
+  }
+  if (tasks.in_progress_label !== "" && tasks.in_progress_label === tasks.blocked_label) {
+    issues.push("in_progress_label and blocked_label must differ");
+  }
+  if (tasks.skip_labels.includes(tasks.label)) {
+    issues.push(`label "${tasks.label}" is also in skip_labels, so no issue could be picked`);
+  }
+  if (tasks.source === "github_issues" && !tasks.assign && tasks.in_progress_label === "") {
+    issues.push("an issue must be claimed somehow: set assign = true or an in_progress_label");
+  }
+  return issues;
 }
 
 export function expandHome(p: string): string {

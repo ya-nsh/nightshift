@@ -1,17 +1,30 @@
 import path from "node:path";
 import type { z } from "zod";
 import type { Config } from "./config.js";
+import {
+  BLOCKED_COLOR,
+  BLOCKED_DESCRIPTION,
+  hasLabel,
+  IN_PROGRESS_COLOR,
+  IN_PROGRESS_DESCRIPTION,
+  ineligible,
+  quote,
+  rankIssues,
+  releaseClaim,
+} from "./issues.js";
 import type {
   Agent,
   AgentResult,
   Forge,
   Host,
+  Issue,
   Reviewer,
   UsageMeter,
   UsageWindows,
 } from "./ports.js";
 import { isActive, nextStart } from "./schedule.js";
 import {
+  finalizeIssueResult,
   finalizeResult,
   type ImplementResult,
   implementResult,
@@ -19,7 +32,7 @@ import {
   stepResult,
   toJsonSchema,
 } from "./schemas.js";
-import type { ItemState, Phase, RunState, StateStore } from "./state.js";
+import type { ItemIssue, ItemState, Phase, RunState, StateStore } from "./state.js";
 import { render, type TemplateName, type Templates } from "./templates.js";
 import {
   account,
@@ -126,6 +139,26 @@ export function newRunState(runId: string, now: Date, repo: string, prompt: stri
 }
 
 /**
+ * A run whose tasks come from GitHub issues (`[tasks] source = "github_issues"`): it starts without
+ * an item and picks the first issue itself. `instructions` (from `--prompt`) go with every issue.
+ */
+export function newIssuesRunState(
+  runId: string,
+  now: Date,
+  instructions: string | undefined,
+): RunState {
+  return {
+    version: 1,
+    runId,
+    startedAt: now.toISOString(),
+    status: "running",
+    itemsCompleted: 0,
+    costUsd: 0,
+    issues: instructions === undefined || instructions.trim() === "" ? {} : { instructions },
+  };
+}
+
+/**
  * Drives one item at a time through
  * implement → review ⇄ address → checks ⇄ fix_checks → merge (⇄ resolve_conflicts) → finalize,
  * persisting state after every transition so a crash or Ctrl-C resumes where it stopped.
@@ -143,7 +176,8 @@ export class Pipeline {
   async run(options: InvocationOptions): Promise<Exit> {
     this.signal = options.signal;
     const item = this.state.item;
-    if (this.state.status === "done" || item === undefined) {
+    // A run on GitHub issues may sit between items: it picks the next issue itself.
+    if (this.state.status === "done" || (item === undefined && !this.fromIssues())) {
       return {
         kind: "done",
         reason: this.state.haltReason ?? "run already finished",
@@ -151,20 +185,21 @@ export class Pipeline {
       };
     }
     if (options.answer !== undefined) {
-      if (item.pendingQuestion === undefined) {
+      if (item?.pendingQuestion === undefined) {
         throw new Error("the run is not waiting for an answer (no open question)");
       }
       item.pendingAnswer = options.answer;
-    } else if (item.pendingQuestion !== undefined && item.pendingAnswer === undefined) {
+    } else if (item?.pendingQuestion !== undefined && item.pendingAnswer === undefined) {
       throw new Error(`the run is waiting for an answer: ${item.pendingQuestion}\nuse --answer`);
     }
-    this.freshStart(item);
+    if (item !== undefined) this.freshStart(item);
     const maxItems = options.maxItems ?? this.deps.config.limits.max_items;
     this.state.status = "running";
     delete this.state.haltReason;
     this.deps.host.clearStop();
     await this.save();
-    await this.event({ type: "invocation_start", item: item.index, phase: item.phase });
+    await this.event({ type: "invocation_start", item: item?.index, phase: item?.phase });
+    if (item?.issue !== undefined) await this.unflagIssue(item, item.issue);
 
     try {
       for (;;) {
@@ -173,8 +208,13 @@ export class Pipeline {
           this.deps.host.clearStop();
           return await this.pause("stop requested (STOP file)");
         }
-        const current = this.state.item;
-        if (current === undefined) return await this.finish("no task left");
+        let current = this.state.item;
+        if (current === undefined) {
+          if (!this.fromIssues()) return await this.finish("no task left");
+          const picked = await this.pickIssue();
+          if (typeof picked === "string") return await this.finish(picked);
+          current = picked;
+        }
         const exit = await this.step(current);
         if (exit) return exit;
         if (current !== this.state.item && maxItems > 0 && this.itemsThisInvocation >= maxItems) {
@@ -248,6 +288,13 @@ export class Pipeline {
   // ── phases ──────────────────────────────────────────────────────────────
 
   private async implement(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
+    if (item.issue !== undefined && item.issue.claimed !== true) {
+      // nightshift stopped between picking the issue and claiming it.
+      const lost = await this.claim(item, item.issue);
+      if (lost !== undefined) {
+        return this.halt(`issue #${item.issue.number} was claimed elsewhere: ${lost}`, "halted");
+      }
+    }
     const result = await this.agentStep(item, "implement", implementResult, restarted, {
       handoff: item.handoff,
     });
@@ -258,6 +305,7 @@ export class Pipeline {
       case "blocked":
         return this.blocked(item, r.question ?? r.summary);
       case "all_done":
+        if (item.issue !== undefined) return this.setIssueAside(item, item.issue, r.summary);
         delete this.state.item;
         return this.finish(`no task left: ${r.summary}`);
       case "failed":
@@ -555,6 +603,7 @@ export class Pipeline {
 
   private async finalize(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
     const pr = this.requirePr(item);
+    if (item.issue !== undefined) return this.finalizeIssue(item, item.issue, pr, restarted);
     const aliases = Object.keys(this.deps.config.repos) as [string, ...string[]];
     const schema = finalizeResult(aliases);
     const result = await this.agentStep(item, "finalize", schema, restarted, {
@@ -590,6 +639,275 @@ export class Pipeline {
       return this.blocked(next, r.question ?? r.summary);
     }
     return this.blocked(item, r.question ?? r.summary);
+  }
+
+  /** Post-merge work for an issue item; the next item comes from the issues, not from Claude. */
+  private async finalizeIssue(
+    item: ItemState,
+    issue: ItemIssue,
+    pr: NonNullable<ItemState["pr"]>,
+    restarted: boolean,
+  ): Promise<Exit | undefined> {
+    if (issue.finalized !== true) {
+      const result = await this.agentStep(item, "finalize-issue", finalizeIssueResult, restarted, {
+        ...this.prVars(pr),
+        merge_sha: item.mergeSha ?? "(unknown)",
+        issue_number: issue.number,
+        issue_url: issue.url,
+        label: this.deps.config.tasks.label,
+      });
+      if (!result.ok) return result.exit;
+      if (result.value.status === "blocked") {
+        return this.blocked(item, result.value.question ?? result.value.summary);
+      }
+      issue.finalized = true;
+      await this.save();
+    }
+    await this.ensureIssueClosed(item, issue, pr);
+    await this.completeItem(item);
+    delete this.state.item;
+    return undefined;
+  }
+
+  // ── GitHub issues as the task source ───────────────────────────────────
+
+  private fromIssues(): boolean {
+    return this.deps.config.tasks.source === "github_issues";
+  }
+
+  /**
+   * Picks the next open issue, makes it the current item and claims it. Returns why there is none
+   * when no issue is left.
+   */
+  private async pickIssue(): Promise<ItemState | string> {
+    const { forge, config } = this.deps;
+    const { tasks } = config;
+    const slug = await forge.repoSlug(this.repoDir(tasks.repo));
+    const me = await forge.currentUser();
+    this.state.issues ??= {};
+    const runIssues = this.state.issues;
+    const exclude = new Set(runIssues.skipped ?? []);
+    const { queue } = rankIssues(await forge.listIssues(slug, tasks.label), tasks, me, exclude);
+    for (const candidate of queue) {
+      // The listing has no bodies, and the issue may have changed since: read it again.
+      const issue = await forge.issue(slug, candidate.number);
+      const why = ineligible(issue, tasks, me, exclude);
+      if (why !== undefined) {
+        this.deps.host.log(`skipping issue #${issue.number}: ${why}`);
+        continue;
+      }
+      const index = (runIssues.picked ?? this.state.itemsCompleted) + 1;
+      const instructions = runIssues.instructions?.trim() ?? "";
+      const handoff = render(this.deps.templates.issue, {
+        issue_number: issue.number,
+        issue_title: issue.title,
+        issue_url: issue.url,
+        issue_author: issue.author || "unknown",
+        issue_body: issue.body.trim() === "" ? "(no description)" : issue.body.trim(),
+        repo_slug: slug,
+        label: tasks.label,
+        instructions:
+          instructions === "" ? "" : `\n## Instructions for this run\n\n${instructions}\n`,
+      });
+      const item = newItem(index, tasks.repo, handoff);
+      item.label = `#${issue.number} ${issue.title}`;
+      item.issue = { number: issue.number, title: issue.title, url: issue.url, repoSlug: slug };
+      runIssues.picked = index;
+      this.state.item = item;
+      await this.save();
+      await this.event({ type: "issue_picked", item: index, issue: issue.url });
+      this.log(item, `picked issue ${issue.url}`);
+      const lost = await this.claim(item, item.issue, issue);
+      if (lost === undefined) return item;
+      this.log(item, `lost issue #${issue.number} to another claim (${lost}); trying the next one`);
+      const lostIssue = item.issue;
+      await this.github(item, `release issue #${issue.number}`, () =>
+        releaseClaim(forge, lostIssue),
+      );
+      exclude.add(issue.number);
+      delete this.state.item;
+      await this.save();
+    }
+    return `no open issue labelled "${tasks.label}" is left to do in ${slug}`;
+  }
+
+  /**
+   * Claims the issue for this run: the in-progress label and/or an assignment to nightshift's
+   * account. What it adds is recorded before it is added, so a crash in between still releases it.
+   * Returns why the claim was lost to someone else, or undefined.
+   */
+  private async claim(
+    item: ItemState,
+    issue: ItemIssue,
+    current?: Issue,
+  ): Promise<string | undefined> {
+    const { forge } = this.deps;
+    const { tasks } = this.deps.config;
+    const me = await forge.currentUser();
+    const before = current ?? (await forge.issue(issue.repoSlug, issue.number));
+    if (tasks.in_progress_label !== "") issue.claimLabel ??= tasks.in_progress_label;
+    if (tasks.assign && issue.assignee === undefined && !before.assignees.includes(me)) {
+      issue.assignee = me;
+    }
+    await this.save();
+    if (issue.claimLabel !== undefined) {
+      await forge.ensureLabel(
+        issue.repoSlug,
+        issue.claimLabel,
+        IN_PROGRESS_COLOR,
+        IN_PROGRESS_DESCRIPTION,
+      );
+    }
+    await forge.editIssue(issue.repoSlug, issue.number, {
+      addLabels:
+        issue.claimLabel !== undefined && !hasLabel(before, issue.claimLabel)
+          ? [issue.claimLabel]
+          : [],
+      addAssignees:
+        issue.assignee !== undefined && !before.assignees.includes(issue.assignee)
+          ? [issue.assignee]
+          : [],
+    });
+    const after = await forge.issue(issue.repoSlug, issue.number);
+    const others = after.assignees.filter((login) => login.toLowerCase() !== me.toLowerCase());
+    if (others.length > 0) return `assigned to ${others.join(", ")}`;
+    issue.claimed = true;
+    await this.save();
+    await this.event({ type: "issue_claimed", item: item.index, issue: issue.url });
+    return undefined;
+  }
+
+  /**
+   * Claude found nothing to change for this issue: say so on the issue, label it for a human, let
+   * go of it and go on with the next issue. GitHub errors here are logged, not fatal: the run has
+   * already decided, and `skipped` keeps it from picking the issue again.
+   */
+  private async setIssueAside(
+    item: ItemState,
+    issue: ItemIssue,
+    summary: string,
+  ): Promise<undefined> {
+    const { forge } = this.deps;
+    const blocked = this.deps.config.tasks.blocked_label;
+    this.log(item, `no change needed for issue #${issue.number}; setting it aside`);
+    await this.github(item, `set issue #${issue.number} aside`, async () => {
+      const relabel =
+        blocked === ""
+          ? ""
+          : ` It is labelled \`${blocked}\` so nightshift does not pick it again; remove the label to queue it again, or close the issue.`;
+      await forge.commentIssue(
+        issue.repoSlug,
+        issue.number,
+        `**nightshift** looked at this issue and opened no pull request:\n\n${quote(summary)}\n\n${relabel.trim()}`.trim(),
+      );
+      if (blocked !== "") {
+        await forge.ensureLabel(issue.repoSlug, blocked, BLOCKED_COLOR, BLOCKED_DESCRIPTION);
+        await forge.editIssue(issue.repoSlug, issue.number, { addLabels: [blocked] });
+      }
+      await releaseClaim(forge, issue);
+    });
+    this.state.issues ??= {};
+    this.state.issues.skipped = [...(this.state.issues.skipped ?? []), issue.number];
+    await this.event({ type: "issue_set_aside", item: item.index, issue: issue.url, summary });
+    delete this.state.item;
+    await this.save();
+    return undefined;
+  }
+
+  /**
+   * After the merge: the PR's `Closes #N` normally closed the issue already; if not, close it with a
+   * comment linking the PR. The in-progress label comes off; the assignee stays as a record.
+   */
+  private async ensureIssueClosed(
+    item: ItemState,
+    issue: ItemIssue,
+    pr: NonNullable<ItemState["pr"]>,
+  ): Promise<void> {
+    const { forge } = this.deps;
+    let current = await forge.issue(issue.repoSlug, issue.number);
+    if (current.state === "OPEN") {
+      await forge.closeIssue(
+        issue.repoSlug,
+        issue.number,
+        `Fixed by ${pr.url}${item.mergeSha === undefined ? "" : ` (merged as ${item.mergeSha})`}. Closed by nightshift.`,
+      );
+      current = await forge.issue(issue.repoSlug, issue.number);
+      if (current.state !== "CLOSED") {
+        throw new Error(`issue #${issue.number} is still open after closing it`);
+      }
+      this.log(item, `closed issue ${issue.url}`);
+      await this.event({
+        type: "issue_closed",
+        item: item.index,
+        issue: issue.url,
+        by: "nightshift",
+      });
+    } else {
+      this.log(item, `issue ${issue.url} is closed`);
+      await this.event({ type: "issue_closed", item: item.index, issue: issue.url, by: "github" });
+    }
+    const label = issue.claimLabel;
+    if (label !== undefined && hasLabel(current, label)) {
+      await this.github(item, `remove label "${label}"`, () =>
+        forge.editIssue(issue.repoSlug, issue.number, { removeLabels: [label] }),
+      );
+    }
+  }
+
+  /**
+   * The run stopped on an issue item and needs a human: label the issue and say why on it (once
+   * per distinct reason, across resumes). Best effort: a GitHub failure here must not hide the stop.
+   */
+  private async noteIssue(reason: string, kind: "halted" | "blocked"): Promise<void> {
+    const item = this.state.item;
+    const issue = item?.issue;
+    if (item === undefined || issue === undefined) return;
+    const { forge } = this.deps;
+    const blocked = this.deps.config.tasks.blocked_label;
+    if (issue.noted !== reason) {
+      await this.github(item, `comment on issue #${issue.number}`, async () => {
+        const next =
+          kind === "blocked"
+            ? 'It needs an answer: whoever runs nightshift continues with `nightshift resume --answer "…"`.'
+            : "Once the cause is fixed, `nightshift resume` continues; `nightshift run --force` abandons the run and releases this issue.";
+        const pr = item.pr === undefined ? "" : `\n\nPull request: ${item.pr.url}`;
+        await forge.commentIssue(
+          issue.repoSlug,
+          issue.number,
+          `**nightshift stopped** on this issue (run \`${this.state.runId}\`, step \`${item.phase}\`):\n\n${quote(reason)}${pr}\n\n${next}`,
+        );
+        issue.noted = reason;
+      });
+    }
+    if (blocked !== "" && issue.flagged === undefined) {
+      await this.github(item, `label issue #${issue.number} "${blocked}"`, async () => {
+        await forge.ensureLabel(issue.repoSlug, blocked, BLOCKED_COLOR, BLOCKED_DESCRIPTION);
+        await forge.editIssue(issue.repoSlug, issue.number, { addLabels: [blocked] });
+        issue.flagged = blocked;
+      });
+    }
+  }
+
+  /** On `resume`: a human has looked at it, so the blocked label comes off again. */
+  private async unflagIssue(item: ItemState, issue: ItemIssue): Promise<void> {
+    const label = issue.flagged;
+    if (label === undefined) return;
+    await this.github(item, `remove label "${label}"`, async () => {
+      await this.deps.forge.editIssue(issue.repoSlug, issue.number, { removeLabels: [label] });
+      delete issue.flagged;
+    });
+    await this.save();
+  }
+
+  /** Runs a GitHub update whose failure should be logged and recorded, not stop the run. */
+  private async github(item: ItemState, what: string, body: () => Promise<void>): Promise<void> {
+    try {
+      await body();
+    } catch (error) {
+      const message = (error as Error).message;
+      this.log(item, `could not ${what}: ${message}`);
+      await this.event({ type: "issue_update_failed", item: item.index, what, error: message });
+    }
   }
 
   // ── helpers ─────────────────────────────────────────────────────────────
@@ -1108,6 +1426,8 @@ export class Pipeline {
   private async halt(reason: string, kind: "halted" | "blocked" | "paused"): Promise<Exit> {
     this.state.status = "halted";
     this.state.haltReason = reason;
+    // A planned pause or Ctrl-C is no news for the issue; everything else needs a human.
+    if (kind !== "paused" && !this.signal.aborted) await this.noteIssue(reason, kind);
     await this.save();
     await this.event({
       type: kind,
@@ -1153,8 +1473,12 @@ export class Pipeline {
   }
 
   private repoPath(item: ItemState): string {
-    const dir = this.deps.config.repos[item.repo];
-    if (dir === undefined) throw new Error(`unknown repo alias "${item.repo}"`);
+    return this.repoDir(item.repo);
+  }
+
+  private repoDir(alias: string): string {
+    const dir = this.deps.config.repos[alias];
+    if (dir === undefined) throw new Error(`unknown repo alias "${alias}"`);
     return dir;
   }
 

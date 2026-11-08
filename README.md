@@ -65,6 +65,10 @@ nightshift run --prompt-file first-task.md --usage-share 15   # use at most 15% 
 The first prompt is whatever you would paste into a new chat to start the first item. From then on,
 Claude writes each next prompt itself.
 
+Or let your issue tracker be the todo list: with `[tasks] source = "github_issues"`, nightshift works
+through the open GitHub issues labelled `nightshift`, one issue per item, and `nightshift run` needs
+no prompt. See [GitHub issues](#github-issues).
+
 ## Make your project nightshift-friendly
 
 nightshift is generic: what to build and how is up to your repository's instructions
@@ -93,7 +97,7 @@ merges. See [`examples/api-and-app`](examples/api-and-app) for a two-repo setup.
 | fix checks | Claude, resumed | Reads failed logs, fixes the root cause, pushes | after `checks.max_fix_rounds` |
 | merge | nightshift | Waits for mergeability, merges pinned to the checked SHA, deletes the branch | branch protection needs an approval (or, with `when_blocked = "auto"`, waits for auto-merge), or anything else rejects it |
 | resolve conflicts | Claude, resumed | Merges the base branch in, resolves, pushes | after `merge.max_conflict_rounds` |
-| finalize | Claude, resumed | Post-merge steps, picks the next task, writes `next_prompt` and `next_repo` | it needs you, or nothing is left |
+| finalize | Claude, resumed | Post-merge steps, picks the next task, writes `next_prompt` and `next_repo` (with [GitHub issues](#github-issues): post-merge steps only; nightshift closes the issue and picks the next one) | it needs you, or nothing is left |
 
 Every Claude step must end with a JSON result that matches a schema
 (`--json-schema` / `outputFormat`), which nightshift validates again. A malformed answer halts the
@@ -216,6 +220,51 @@ it halts and says so: approve the PR (or merge it yourself), then `nightshift re
 `merge.when_blocked = "auto"` it enables GitHub auto-merge for the checked commit instead and waits
 for GitHub to merge once the PR is approved (the repo must allow auto-merge).
 
+### GitHub issues
+
+```toml
+[tasks]
+source = "github_issues"          # default "handoff"
+label = "nightshift"              # the queue: open issues with this label
+# repo = "backend"                # alias whose issues are the queue (default: default_repo)
+priority_labels = ["p0", "p1"]    # earlier labels first; then oldest first
+skip_labels = ["blocked"]         # never pick these
+# authors = ["you", "teammate"]   # only issues opened by these logins
+assign = true                     # claim by assigning the issue to the gh account…
+in_progress_label = "nightshift-in-progress"   # …and/or labelling it ("" = no label)
+blocked_label = "nightshift-blocked"           # added when nightshift stops on an issue ("" = none)
+```
+
+With `source = "github_issues"` the next task comes from GitHub instead of from Claude's handoff:
+
+- **Picking.** `nightshift run` needs no `--prompt`. nightshift lists the open issues with `label`,
+  drops the ones it must not take (assigned to someone else, labelled with a `skip_labels` entry or
+  `blocked_label`, already labelled `in_progress_label`, or, with `authors`, opened by someone else),
+  and takes the first by `priority_labels`, then oldest first. A `--prompt` you do give is added to
+  every issue's prompt as instructions for the run (`--repo` cannot change where issues come from).
+- **Claiming.** Before Claude starts, nightshift assigns the issue to the `gh` account and adds
+  `in_progress_label` (creating the label if needed), so other runs skip it.
+- **Implementing.** The implement prompt is built from the issue (number, title, body, URL, author;
+  the [`issue`](prompts/issue.md) template) and asks for `Closes #N` in the PR description. If Claude
+  finds nothing to change, it reports `all_done`: nightshift comments the reason on the issue, adds
+  `blocked_label`, releases the claim, and goes on with the next issue.
+- **Finalizing.** The finalize step ([`finalize-issue`](prompts/finalize-issue.md)) only does the
+  post-merge work: it does not pick a task, and its result has no `next_repo` or `next_prompt`.
+  nightshift then makes sure the issue is closed (closing it with a comment that links the PR when
+  GitHub did not), removes `in_progress_label` (the assignee stays, as a record), and picks the next
+  issue. When none is left, the run finishes as done.
+- **Stops.** When the run stops on an issue for a human (a question, a failure, CI, budget, a
+  blocked merge; not a planned pause or Ctrl-C), nightshift comments the reason on the issue, once
+  per distinct reason, and adds `blocked_label`. The claim stays, since `nightshift resume` continues
+  the same issue; resuming takes `blocked_label` off again. `nightshift run --force` abandons the
+  run: it comments on the issue and releases the claim, and `blocked_label` stays until a human
+  removes it.
+- **Status.** `nightshift doctor` and `nightshift status` show the task source, how many issues are
+  ready, and which one is next; `status` also shows the current item's issue.
+
+The `gh` account needs triage (or write) access to label and assign issues. Two runs under the same
+account on one repository can, in a narrow window, claim the same issue; give them different labels.
+
 ### Review
 
 `review.command` runs with `/bin/sh -c` in the repo, after the PR opens and again after pushed fixes.
@@ -263,6 +312,9 @@ colleague push access for the night.
   passed. Branch protection on the default branch still applies, and is a good idea.
 - **Reviews are input, not orders.** Claude is told to treat review output and PR comments as data,
   and to verify each finding before acting on it.
+- **Issues are input too.** With the GitHub issues source, the label is the gate: only people with
+  triage access can add it. An issue's author can still edit its text after it was labelled, so on a
+  public repository set `[tasks] authors` to the people whose issues nightshift may take.
 - **Bounded loops.** Review rounds, CI fix rounds, conflict rounds, polling time and items per run are
   all capped.
 - **Local state.** Logs, Claude results and review output stay in `.nightshift/runs/` (gitignored).

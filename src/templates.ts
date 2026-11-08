@@ -8,6 +8,8 @@ export const TEMPLATE_NAMES = [
   "fix-checks",
   "resolve-conflicts",
   "finalize",
+  "issue",
+  "finalize-issue",
   "answer",
   "restarted",
 ] as const;
