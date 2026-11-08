@@ -1,7 +1,15 @@
 import path from "node:path";
 import type { z } from "zod";
 import type { Config } from "./config.js";
-import type { Agent, AgentResult, Forge, Host, Reviewer } from "./ports.js";
+import type {
+  Agent,
+  AgentResult,
+  Forge,
+  Host,
+  Reviewer,
+  UsageMeter,
+  UsageWindows,
+} from "./ports.js";
 import {
   finalizeResult,
   type ImplementResult,
@@ -12,11 +20,30 @@ import {
 } from "./schemas.js";
 import type { ItemState, Phase, RunState, StateStore } from "./state.js";
 import { render, type TemplateName, type Templates } from "./templates.js";
+import {
+  account,
+  describeUsage,
+  formatTime,
+  type LimitHit,
+  limitHit,
+  limitsEnabled,
+  missingWindows,
+  sameWindow,
+  type UsageLimits,
+  usageLimits,
+  WINDOW_LABEL,
+} from "./usage.js";
 
 /** Below this many USD left, a Claude step is not worth starting. */
 export const MIN_STEP_BUDGET_USD = 0.5;
 const MERGEABILITY_RETRIES = 6;
 const MERGEABILITY_WAIT_MS = 5_000;
+/** Re-read usage this long after a window's reset time, so the reset has surely happened. */
+const USAGE_RESET_GRACE_MS = 60_000;
+/** While waiting for a reset, wake up this often to notice `nightshift stop` and Ctrl-C. */
+const USAGE_WAIT_SLICE_MS = 60_000;
+const USAGE_READ_ATTEMPTS = 3;
+const USAGE_RETRY_MS = 5_000;
 
 export interface PipelineDeps {
   config: Config;
@@ -26,6 +53,8 @@ export interface PipelineDeps {
   reviewer: Reviewer;
   host: Host;
   store: StateStore;
+  /** Required when `[usage]` limits are configured. */
+  usage?: UsageMeter;
 }
 
 export interface InvocationOptions {
@@ -54,7 +83,17 @@ export interface Exit {
 
 class Aborted extends Error {}
 
-type StepOutcome<T> = { ok: true; value: T } | { ok: false; exit: Exit };
+/** `exit: undefined` means "run this phase again" (the usage limit stopped the step part-way). */
+type StepOutcome<T> = { ok: true; value: T } | { ok: false; exit: Exit | undefined };
+
+/** What a usage check before a step decided. */
+type UsageGate = { ok: true; before: UsageWindows | undefined } | { ok: false; exit: Exit };
+
+interface AgentCall {
+  result: AgentResult;
+  /** Set when the usage limit stopped the step. */
+  cut: LimitHit | undefined;
+}
 
 export function newItem(index: number, repo: string, handoff: string): ItemState {
   return {
@@ -145,7 +184,7 @@ export class Pipeline {
   }
 
   private async step(item: ItemState): Promise<Exit | undefined> {
-    const restarted = item.inFlight === item.phase;
+    const restarted = item.inFlight === item.phase || item.interruptedPhase === item.phase;
     item.inFlight = item.phase;
     await this.save();
     const exit = await this.runPhase(item, restarted);
@@ -216,6 +255,10 @@ export class Pipeline {
     const { review } = this.deps.config;
     const disk = await this.diskExit();
     if (disk) return disk;
+    // A review command may well use Claude too (`claude -p "/code-review …"`): it is held to the
+    // same limits, and what it uses counts as nightshift's.
+    const gate = await this.usageGate();
+    if (!gate.ok) return gate.exit;
     this.log(item, `review round ${item.reviewRound}/${review.max_rounds}`);
     const result = await this.deps.reviewer.run({
       command: review.command,
@@ -229,6 +272,7 @@ export class Pipeline {
       signal: this.signal,
     });
     if (this.signal.aborted) throw new Aborted();
+    if (gate.before !== undefined) await this.accountSince(item, "review", gate.before);
     await this.event({
       type: "review",
       item: item.index,
@@ -491,6 +535,11 @@ export class Pipeline {
       };
     }
 
+    const gate = await this.usageGate();
+    if (!gate.ok) return gate;
+    // Cleared only once the step really starts again, so a pause before then keeps the restart.
+    delete item.interruptedPhase;
+
     const allVars = {
       repo: item.repo,
       repo_path: this.repoPath(item),
@@ -512,19 +561,39 @@ export class Pipeline {
     // session so Claude keeps the context of this item (and only this item).
     const resume = item.sessionId;
     this.log(item, `${template}${resume ? "" : " (fresh session)"} · budget $${left.toFixed(2)}`);
-    let result = await this.callAgent(item, template, prompt, schema, left, resume);
-    if (result.outcome === "error" && resume !== undefined && restarted) {
+    let call = await this.callAgent(item, template, prompt, schema, left, resume, gate.before);
+    if (
+      call.cut === undefined &&
+      call.result.outcome === "error" &&
+      resume !== undefined &&
+      restarted
+    ) {
       // The interrupted session may never have been persisted; start over in a fresh one.
-      this.log(item, `could not resume session (${result.detail}); retrying in a fresh session`);
+      this.log(
+        item,
+        `could not resume session (${call.result.detail}); retrying in a fresh session`,
+      );
       delete item.sessionId;
-      result = await this.callAgent(
+      const again = await this.usageGate();
+      if (!again.ok) return again;
+      call = await this.callAgent(
         item,
         template,
         prompt,
         schema,
-        left - result.costUsd,
+        left - call.result.costUsd,
         undefined,
+        again.before,
       );
+    }
+    const { result, cut } = call;
+    if (cut !== undefined && result.outcome === "aborted" && !this.signal.aborted) {
+      // Stopped by the usage limit: keep any answer for the restart, and run the phase again once
+      // the usage gate lets it (after the window resets, or on `resume` with on_limit = "halt").
+      item.interruptedPhase = item.phase;
+      await this.save();
+      await this.event({ type: "usage_cut", item: item.index, step: template, reason: cut.reason });
+      return { ok: false, exit: undefined };
     }
     delete item.pendingAnswer;
     delete item.pendingQuestion;
@@ -571,17 +640,29 @@ export class Pipeline {
     schema: z.ZodType,
     maxBudgetUsd: number,
     resumeSessionId: string | undefined,
-  ): Promise<AgentResult> {
+    usageBefore: UsageWindows | undefined,
+  ): Promise<AgentCall> {
     const attempt = Date.now();
-    const result = await this.deps.agent.run({
+    const guard = new AbortController();
+    const running = this.deps.agent.run({
       cwd: this.repoPath(item),
       prompt,
       schema: toJsonSchema(schema),
       ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
       maxBudgetUsd,
       artifactPath: this.artifact(item, `${template}-${attempt}.json`),
-      signal: this.signal,
+      signal:
+        usageBefore === undefined ? this.signal : AbortSignal.any([this.signal, guard.signal]),
     });
+    let cut: LimitHit | undefined;
+    let result: AgentResult;
+    if (usageBefore === undefined) {
+      result = await running;
+    } else {
+      const watched = await this.watchUsage(item, template, running, usageBefore, guard);
+      result = watched.result;
+      cut = watched.cut;
+    }
     item.costUsd += result.costUsd;
     this.state.costUsd += result.costUsd;
     this.invocationCostUsd += result.costUsd;
@@ -594,7 +675,185 @@ export class Pipeline {
       costUsd: result.costUsd,
       sessionId: result.sessionId,
     });
-    return result;
+    return { result, cut };
+  }
+
+  // ── plan usage ──────────────────────────────────────────────────────────
+
+  private usageLimits(): UsageLimits {
+    return usageLimits(this.deps.config.usage, this.state.usageShare);
+  }
+
+  /**
+   * Before a step that uses Claude: reads plan usage and, while a limit is reached, waits for the
+   * window to reset (on_limit = "wait") or pauses the run (on_limit = "halt"). Returns the reading
+   * the step's own usage is measured from; undefined when no limits are configured.
+   */
+  private async usageGate(): Promise<UsageGate> {
+    const limits = this.usageLimits();
+    if (!limitsEnabled(limits)) return { ok: true, before: undefined };
+    const { usage } = this.deps.config;
+    for (;;) {
+      const reading = await this.readUsage(USAGE_READ_ATTEMPTS);
+      if (!reading.ok) {
+        return {
+          ok: false,
+          exit: await this.halt(
+            `cannot read Claude plan usage, so the [usage] limits cannot be kept: ${reading.detail}`,
+            "halted",
+          ),
+        };
+      }
+      const missing = missingWindows(limits, reading.windows);
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          exit: await this.halt(
+            `Claude reported no ${missing.map((w) => WINDOW_LABEL[w]).join(" or ")} usage window, so its [usage] limit cannot be kept`,
+            "halted",
+          ),
+        };
+      }
+      const usageState = this.usageState();
+      const hit = limitHit(limits, usageState.tally, reading.windows);
+      if (hit === undefined) return { ok: true, before: reading.windows };
+
+      const now = this.deps.host.now();
+      const resetsAt = hit.resetsAt === undefined ? Number.NaN : Date.parse(hit.resetsAt);
+      const until = Math.max(
+        Number.isNaN(resetsAt) ? 0 : resetsAt + USAGE_RESET_GRACE_MS,
+        now.getTime() + usage.check_seconds * 1000,
+      );
+      if (usage.on_limit === "halt") {
+        return {
+          ok: false,
+          exit: await this.pause(
+            `usage limit: ${hit.reason}; the ${WINDOW_LABEL[hit.window]} window resets ${formatTime(hit.resetsAt, now)}`,
+          ),
+        };
+      }
+      const untilIso = new Date(until).toISOString();
+      this.deps.host.log(
+        `usage limit: ${hit.reason}; waiting until ${formatTime(untilIso, now)} for the ${WINDOW_LABEL[hit.window]} window to reset`,
+      );
+      usageState.waitingUntil = untilIso;
+      usageState.waitingFor = hit.reason;
+      await this.save();
+      await this.event({ type: "usage_wait", reason: hit.reason, until: untilIso });
+      const stopped = await this.waitUntil(until);
+      delete usageState.waitingUntil;
+      delete usageState.waitingFor;
+      await this.save();
+      if (stopped) return { ok: false, exit: stopped };
+    }
+  }
+
+  /** Sleeps until `until` (epoch ms) in slices; returns an exit if a stop was requested. */
+  private async waitUntil(until: number): Promise<Exit | undefined> {
+    for (;;) {
+      if (this.signal.aborted) throw new Aborted();
+      if (this.deps.host.stopRequested()) {
+        this.deps.host.clearStop();
+        return this.pause("stop requested (STOP file)");
+      }
+      const left = until - this.deps.host.now().getTime();
+      if (left <= 0) return undefined;
+      await this.deps.host.sleep(Math.min(left, USAGE_WAIT_SLICE_MS), this.signal);
+    }
+  }
+
+  /**
+   * Runs alongside a Claude step: re-reads usage every `check_seconds`, adds what the step used to
+   * nightshift's tally, and stops the step as soon as a limit is reached. Takes a last reading when
+   * the step ends, so short steps are counted too.
+   */
+  private async watchUsage(
+    item: ItemState,
+    template: TemplateName,
+    running: Promise<AgentResult>,
+    before: UsageWindows,
+    guard: AbortController,
+  ): Promise<{ result: AgentResult; cut: LimitHit | undefined }> {
+    const limits = this.usageLimits();
+    const usageState = this.usageState();
+    const finished = new AbortController();
+    const settled = running.finally(() => finished.abort());
+    settled.catch(() => {}); // the rejection is handled by awaiting `running` below
+    const stepSignal = AbortSignal.any([finished.signal, this.signal]);
+    const startUsed = { ...usageState.tally };
+    let previous = before;
+    let cut: LimitHit | undefined;
+
+    const take = async (signal: AbortSignal | undefined): Promise<void> => {
+      const reading = await this.deps.usage?.read(signal);
+      if (reading === undefined || !reading.ok) return; // transient; the next reading catches up
+      account(usageState.tally, previous, reading.windows);
+      previous = reading.windows;
+      usageState.last = { at: this.deps.host.now().toISOString(), windows: reading.windows };
+    };
+
+    while (!stepSignal.aborted) {
+      await this.deps.host.sleep(this.deps.config.usage.check_seconds * 1000, stepSignal);
+      if (stepSignal.aborted) break;
+      await take(stepSignal);
+      if (stepSignal.aborted) break;
+      await this.save();
+      const hit = limitHit(limits, usageState.tally, previous);
+      if (hit !== undefined) {
+        cut = hit;
+        this.log(item, `usage limit reached during ${template}: ${hit.reason}; stopping the step`);
+        guard.abort();
+        break;
+      }
+    }
+    const result = await running;
+    if (!this.signal.aborted) await take(undefined);
+    const used: Record<string, number> = {};
+    for (const [window, entry] of Object.entries(usageState.tally)) {
+      const start = startUsed[window as keyof typeof startUsed];
+      const base =
+        start !== undefined && sameWindow(start.resetsAt, entry.resetsAt) ? start.used : 0;
+      used[window] = entry.used - base;
+    }
+    await this.event({ type: "usage", item: item.index, step: template, points: used });
+    if (usageState.last !== undefined) {
+      this.log(
+        item,
+        `usage: ${describeUsage(usageState.last.windows, usageState.tally, limits, this.deps.host.now())}`,
+      );
+    }
+    return { result, cut };
+  }
+
+  /** Adds what was used since `before` (one reading, no watching) to nightshift's tally. */
+  private async accountSince(item: ItemState, step: string, before: UsageWindows): Promise<void> {
+    const reading = await this.readUsage(1);
+    if (!reading.ok) return;
+    const points = account(this.usageState().tally, before, reading.windows);
+    await this.save();
+    await this.event({ type: "usage", item: item.index, step, points });
+  }
+
+  private async readUsage(attempts: number): Promise<Awaited<ReturnType<UsageMeter["read"]>>> {
+    const meter = this.deps.usage;
+    if (meter === undefined) {
+      return { ok: false, detail: "no usage meter is available" };
+    }
+    let reading = await meter.read(this.signal);
+    for (let i = 1; i < attempts && !reading.ok && !this.signal.aborted; i++) {
+      await this.deps.host.sleep(USAGE_RETRY_MS, this.signal);
+      reading = await meter.read(this.signal);
+    }
+    if (this.signal.aborted) throw new Aborted();
+    if (reading.ok) {
+      this.usageState().last = { at: this.deps.host.now().toISOString(), windows: reading.windows };
+    }
+    return reading;
+  }
+
+  private usageState(): NonNullable<RunState["usage"]> {
+    this.state.usage ??= { tally: {} };
+    return this.state.usage;
   }
 
   private stepNotReady(item: ItemState, what: string, r: StepResult): Promise<Exit> {

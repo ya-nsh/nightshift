@@ -59,6 +59,7 @@ $EDITOR .nightshift/config.toml
 nightshift doctor        # checks gh, claude, repos, review command, disk
 nightshift run --prompt-file first-task.md --once   # one supervised item first
 nightshift run --prompt-file first-task.md          # (or `resume`) then let it run
+nightshift run --prompt-file first-task.md --usage-share 15   # use at most 15% of each 5-hour window
 ```
 
 The first prompt is whatever you would paste into a new chat to start the first item. From then on,
@@ -104,6 +105,7 @@ run; it never steers it.
 |---|---|---|
 | Nothing left to do | 0 | 🎉 |
 | Item limit reached (`--once`, `--max-items`, `limits.max_items`) or `nightshift stop` | 0 | `nightshift resume` |
+| Usage limit reached with `on_limit = "halt"` (with `"wait"` it sleeps until the window resets) | 0 | `nightshift resume` after the reset |
 | Claude needs a human | 2 | `nightshift resume --answer "…"`: the answer goes into the same session (or into the next item's prompt) |
 | Something failed (budget, CI, merge, review, disk, agent error) | 3 | fix the cause, then `nightshift resume` |
 | Ctrl-C | 130 | `nightshift resume` (the interrupted step restarts, and Claude is told to check what it already did) |
@@ -130,6 +132,11 @@ max_turns = 200
 item_usd = 25                # all Claude steps of one item together
 invocation_usd = 150         # one `run` / `resume`
 
+[usage]                      # Claude plan limits, see "Usage limits" below
+session_share = 15           # points of each 5-hour window nightshift may use (or --usage-share 15)
+weekly_max = 80              # never push the account's weekly usage past 80%
+on_limit = "wait"            # wait for the reset, or "halt"
+
 [review]
 command = "~/bin/review-pr {pr}"   # {pr} {pr_url} {repo_slug} {repo_path} {branch}
 max_rounds = 2
@@ -147,6 +154,38 @@ min_free_disk_gb = 0
 ```
 
 Relative paths resolve against the directory that holds `.nightshift/`.
+
+### Usage limits
+
+On a Claude subscription (Pro, Max, Team), nightshift can stay inside a share of your plan's usage
+instead of a dollar budget. It reads the same numbers Claude Code's `/usage` shows: the rolling
+**5-hour** ("session") window and the **weekly** window, each as a percentage.
+
+| Setting | Meaning |
+|---|---|
+| `session_share`, `weekly_share` | Percentage points of each window that nightshift itself may use. |
+| `session_max`, `weekly_max` | Don't let the account's total go past this percentage, so you keep headroom. |
+| `on_limit` | `"wait"` (default): sleep until the window resets, then carry on. `"halt"`: pause the run (exit 0); `resume` after the reset. |
+| `check_seconds` | How often usage is re-read while a step runs (default 60). |
+
+`0` means no limit, which is the default for all four. `--usage-share 15` on `run` or `resume` sets
+`session_share` for that run, and later `resume`s keep it.
+
+How it works:
+
+- Usage is account-wide, so your interactive Claude Code sessions count toward it too. nightshift
+  counts as its own only what changes **while its own steps run** (Claude steps and the review
+  command), measured before, during and after each one. Usage in between, such as you working
+  while CI runs, is not counted against its share; it does count toward the `*_max` limits.
+- Before each step, nightshift checks the limits. During a step it re-reads usage every
+  `check_seconds`; if a limit is reached part-way, it stops the step, waits (or pauses), and later
+  restarts it with the "you were interrupted, check what you already did" prompt. A step can
+  overshoot by whatever it uses within one check interval.
+- Usage comes from a `get_usage` request to Claude Code (`claude -p --input-format stream-json`). It
+  runs no model turn and costs nothing, but it is not a documented API. If it can't be read while
+  limits are set, nightshift halts rather than running unmetered. `nightshift doctor` shows the
+  current numbers, and `nightshift status` shows the last reading and any wait.
+- API-key logins have no usage windows; use `[budget]` there.
 
 ### Review
 
@@ -184,7 +223,8 @@ colleague push access for the night.
   Narrow it further with `allowed_tools` and Claude Code's own permission rules, or run it in a
   container or VM. Use `bypassPermissions` only in an isolated environment.
 - **Money.** `budget.item_usd` and `budget.invocation_usd` cap every Claude call (`--max-budget-usd`);
-  nightshift will not start a step with less than $0.50 left.
+  nightshift will not start a step with less than $0.50 left. On a subscription, `[usage]` keeps it
+  inside a share of your 5-hour and weekly limits instead.
 - **Merges.** Only nightshift merges, only after review and green CI, and only the exact commit that
   passed. Branch protection on the default branch still applies, and is a good idea.
 - **Reviews are input, not orders.** Claude is told to treat review output and PR comments as data,

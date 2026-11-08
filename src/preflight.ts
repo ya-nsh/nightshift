@@ -3,6 +3,15 @@ import { statfs } from "node:fs/promises";
 import { loadSdkQuery } from "./agent/sdk.js";
 import { type Config, expandHome } from "./config.js";
 import { exec, shellQuote } from "./exec.js";
+import {
+  ClaudeUsageMeter,
+  describeUsage,
+  limitsEnabled,
+  missingWindows,
+  type UsageTally,
+  usageLimits,
+  WINDOW_LABEL,
+} from "./usage.js";
 
 export interface Check {
   name: string;
@@ -11,7 +20,10 @@ export interface Check {
 }
 
 /** Verifies everything an unattended run depends on, before it spends anything. */
-export async function preflight(config: Config): Promise<Check[]> {
+export async function preflight(
+  config: Config,
+  usage: { share?: number; tally?: UsageTally } = {},
+): Promise<Check[]> {
   const checks: Check[] = [];
   const add = (name: string, ok: boolean, detail: string) => checks.push({ name, ok, detail });
 
@@ -76,6 +88,29 @@ export async function preflight(config: Config): Promise<Check[]> {
       const found = await run("/bin/sh", ["-c", `command -v ${shellQuote(program)}`]);
       add("review command", found.ok, found.ok ? found.out.trim() : `${program} not found on PATH`);
     }
+  }
+
+  const limits = usageLimits(config.usage, usage.share);
+  const enforced = limitsEnabled(limits);
+  const reading = await new ClaudeUsageMeter(config.agent.claude_path, config.home).read();
+  if (reading.ok) {
+    const missing = missingWindows(limits, reading.windows);
+    const summary = describeUsage(reading.windows, usage.tally ?? {}, limits, new Date());
+    add(
+      "plan usage",
+      missing.length === 0,
+      missing.length === 0
+        ? `${summary}${enforced ? ` · on_limit = "${config.usage.on_limit}"` : " (no [usage] limits set)"}`
+        : `no ${missing.map((w) => WINDOW_LABEL[w]).join(" or ")} window reported, so its limit cannot be kept`,
+    );
+  } else {
+    add(
+      "plan usage",
+      !enforced,
+      enforced
+        ? `cannot read it, so the [usage] limits cannot be kept: ${reading.detail}`
+        : `not available (${reading.detail}); fine, no [usage] limits are set`,
+    );
   }
 
   const stats = await statfs(config.home);

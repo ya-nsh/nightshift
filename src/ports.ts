@@ -101,6 +101,29 @@ export interface Reviewer {
   run(request: ReviewRequest): Promise<ReviewResult>;
 }
 
+export interface WindowReading {
+  /** Account-wide utilization of the window, 0–100. */
+  utilization: number;
+  /** When the window resets (ISO time); unknown while nothing has been used in it. */
+  resetsAt: string | undefined;
+}
+
+export interface UsageWindows {
+  /** The rolling 5-hour ("session") window. */
+  five_hour?: WindowReading;
+  /** The weekly window. */
+  seven_day?: WindowReading;
+}
+
+export type UsageReading =
+  | { ok: true; windows: UsageWindows; plan?: string }
+  | { ok: false; detail: string };
+
+/** Reads the Claude subscription's plan usage. Failures are values, never exceptions. */
+export interface UsageMeter {
+  read(signal?: AbortSignal): Promise<UsageReading>;
+}
+
 export interface Host {
   now(): Date;
   sleep(ms: number, signal: AbortSignal): Promise<void>;

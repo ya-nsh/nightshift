@@ -13,6 +13,8 @@ import type {
   Reviewer,
   ReviewRequest,
   ReviewResult,
+  UsageMeter,
+  UsageReading,
 } from "../src/ports.js";
 import { StateStore } from "../src/state.js";
 import { loadTemplates, type Templates } from "../src/templates.js";
@@ -26,7 +28,9 @@ export const failedChecks = (...names: string[]): CheckSummary => ({
   pending: [],
 });
 
-type Scripted = Partial<AgentResult> | ((request: AgentRequest) => Partial<AgentResult>);
+type Scripted =
+  | Partial<AgentResult>
+  | ((request: AgentRequest) => Partial<AgentResult> | Promise<Partial<AgentResult>>);
 
 /** Answers Claude steps from a script, in order, and records every request. */
 export class FakeAgent implements Agent {
@@ -42,14 +46,16 @@ export class FakeAgent implements Agent {
     if (next === undefined) throw new Error(`unexpected agent call #${this.requests.length}`);
     const partial = typeof next === "function" ? next(request) : next;
     const sessionId = request.resumeSessionId ?? `session-${++this.sessions}`;
-    return Promise.resolve({
+    const complete = (p: Partial<AgentResult>): AgentResult => ({
       outcome: "success",
       sessionId,
       costUsd: 0.1,
       structured: undefined,
       detail: "",
-      ...partial,
+      ...p,
     });
+    // Synchronous scripts resolve at once, like a step that finishes before any usage re-check.
+    return partial instanceof Promise ? partial.then(complete) : Promise.resolve(complete(partial));
   }
 }
 
@@ -217,4 +223,63 @@ export async function harness(extraConfig = ""): Promise<Harness> {
     reviewer: new FakeReviewer(),
     host: new FakeHost(),
   };
+}
+
+/** Resolves once the step's signal aborts, the way a real Claude process dies on abort. */
+export function untilAborted(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) resolve();
+    else signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
+export const FIVE_HOURS_MS = 5 * 60 * 60_000;
+
+/**
+ * A Claude plan with a 5-hour window on the fake clock: `use()` adds utilization, and the window
+ * resets to 0 once the clock passes its reset time. Readings add sub-second jitter to the reset
+ * time, like the real API does.
+ */
+export class SimulatedPlan implements UsageMeter {
+  utilization = 0;
+  weekly = 0;
+  resetsAt: number;
+  reads = 0;
+  /** When set, every read fails with this detail. */
+  failure: string | undefined;
+
+  constructor(private readonly host: FakeHost) {
+    this.resetsAt = host.now().getTime() + FIVE_HOURS_MS;
+  }
+
+  use(points: number): void {
+    this.roll();
+    this.utilization += points;
+    this.weekly += points / 10;
+  }
+
+  read(): Promise<UsageReading> {
+    this.reads += 1;
+    if (this.failure !== undefined) return Promise.resolve({ ok: false, detail: this.failure });
+    this.roll();
+    const jitter = this.reads % 1000;
+    return Promise.resolve({
+      ok: true,
+      windows: {
+        five_hour: {
+          utilization: this.utilization,
+          resetsAt: new Date(this.resetsAt + jitter).toISOString(),
+        },
+        seven_day: { utilization: Math.round(this.weekly), resetsAt: "2026-11-10T00:00:00.000Z" },
+      },
+    });
+  }
+
+  private roll(): void {
+    const now = this.host.now().getTime();
+    while (now >= this.resetsAt) {
+      this.utilization = 0;
+      this.resetsAt += FIVE_HOURS_MS;
+    }
+  }
 }
