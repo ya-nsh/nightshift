@@ -37,16 +37,22 @@ const stepOverride = z.strictObject({
   permission_mode: z.enum(PERMISSION_MODES).optional(),
 });
 
+/** `[agent.steps.plan]` (`nightshift plan`): no permission_mode, the plan session is always read-only. */
+const planOverride = stepOverride.omit({ permission_mode: true });
+
 const agentSteps = z
   .strictObject(
-    Object.fromEntries(AGENT_STEPS.map((step) => [step, stepOverride.optional()])) as Record<
-      AgentStep,
-      z.ZodOptional<typeof stepOverride>
-    >,
+    {
+      ...(Object.fromEntries(AGENT_STEPS.map((step) => [step, stepOverride.optional()])) as Record<
+        AgentStep,
+        z.ZodOptional<typeof stepOverride>
+      >),
+      plan: planOverride.optional(),
+    },
     {
       error: (issue) =>
         issue.code === "unrecognized_keys"
-          ? `unknown step${issue.keys.length === 1 ? "" : "s"} ${issue.keys.map((k) => `"${k}"`).join(", ")}; steps are ${AGENT_STEPS.join(", ")}`
+          ? `unknown step${issue.keys.length === 1 ? "" : "s"} ${issue.keys.map((k) => `"${k}"`).join(", ")}; steps are ${AGENT_STEPS.join(", ")}, plan`
           : undefined,
     },
   )
@@ -74,6 +80,8 @@ const configSchema = z.strictObject({
     .strictObject({
       item_usd: z.number().positive().default(25),
       invocation_usd: z.number().positive().default(150),
+      /** Ceiling for one `nightshift plan` session. */
+      plan_usd: z.number().positive().default(2),
     })
     .prefault({}),
   review: z
@@ -215,6 +223,18 @@ export function stepSettings(agent: Config["agent"], step: AgentStep | undefined
     model: override?.model ?? agent.model,
     maxTurns: override?.max_turns ?? agent.max_turns,
     permissionMode: override?.permission_mode ?? agent.permission_mode,
+  };
+}
+
+/**
+ * The model and max_turns of `nightshift plan`: `[agent.steps.plan]` on top of `[agent]`. Its
+ * permission mode is not configurable; the session is always read-only.
+ */
+export function planSettings(agent: Config["agent"]): Omit<StepSettings, "permissionMode"> {
+  const override = agent.steps.plan;
+  return {
+    model: override?.model ?? agent.model,
+    maxTurns: override?.max_turns ?? agent.max_turns,
   };
 }
 

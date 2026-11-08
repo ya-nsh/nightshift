@@ -9,6 +9,8 @@ runs/
 state.json
 lock
 STOP
+plan.md
+plans/
 `;
 
 export function configTemplate(alias: string, ejectedPrompts: boolean): string {
@@ -44,6 +46,7 @@ max_turns = 200                   # per Claude step
 [budget]
 item_usd = 25                     # ceiling for all Claude steps of one item
 invocation_usd = 150              # ceiling for one \`nightshift run\` / \`resume\`
+plan_usd = 2                      # ceiling for one \`nightshift plan\` (read-only preview)
 
 [review]
 # Runs after the PR opens; its output goes to Claude, which addresses the comments.

@@ -57,6 +57,7 @@ cd your-repo
 nightshift init          # writes .nightshift/config.toml (+ .gitignore for its runtime files)
 $EDITOR .nightshift/config.toml
 nightshift doctor        # checks gh, claude, repos, review command, disk
+nightshift plan --prompt-file first-task.md        # optional: preview the next items, read-only
 nightshift run --prompt-file first-task.md --once   # one supervised item first
 nightshift run --prompt-file first-task.md          # (or `resume`) then let it run
 nightshift run --prompt-file first-task.md --usage-share 15   # use at most 15% of each 5-hour window
@@ -132,6 +133,41 @@ prints one frame and exits.
 `nightshift stop` finishes the current step and stops. Configure `[notify] command` to get pinged
 on every stop (ntfy, `terminal-notifier`, Slack webhook…).
 
+## Previewing the next items: `nightshift plan`
+
+```sh
+nightshift plan                    # the next 5 items, from the current run's pending handoff
+nightshift plan -n 3 --write       # also save .nightshift/plan.md
+nightshift plan --prompt-file next.md --repo api --json
+```
+
+`plan` is a dry run. A fresh Claude session reads the repositories' own instructions (AGENTS.md,
+CLAUDE.md, todo lists) and says which items nightshift would do next, in order, without doing any of
+them. For each item: its ID and title, the repo, why it comes now, a rough size (S, M, L, XL), its
+risk, and whether it needs a human (with the question a run would stop on).
+
+- **Where it starts.** `--prompt` / `--prompt-file` (in `--repo`, else `default_repo`). Without
+  one: the current run's next item if it has not started; the items after it if it is under way (a
+  pending question is passed on); otherwise the repositories' instructions from the top.
+- **Read-only.** The session has only Claude Code's Read, Glob and Grep tools (`--tools`), so it
+  cannot edit files, run commands, push or open PRs, whatever your settings allow. It runs in
+  `dontAsk` mode (anything else is denied, never asked), without MCP servers, and every configured
+  repo is readable (`--add-dir`). `allowed_tools`, `permission_mode` and the permission flags of
+  `extra_args` (`--permission-mode`, `--dangerously-skip-permissions`, `--allowedTools`, `--tools`,
+  `--mcp-config`) do not apply to it. (Claude Code's `plan` permission mode is not used: it steers
+  Claude into writing a plan file instead of answering.)
+- **Model.** `[agent.steps.plan]` sets its `model` and `max_turns` (see
+  [Models per step](#models-per-step)); otherwise `[agent]` applies.
+- **Budget and usage.** One plan costs at most `[budget] plan_usd` (default $2). With `[usage]`
+  limits set, `plan` refuses to start at a limit instead of waiting; share limits count the current
+  run's tally, and a plan's own usage is not added to it.
+- **Next to a live run.** `plan` takes no lock and never writes `state.json`: it plans from the run's
+  state as it is when it starts, so it is safe while `nightshift run` is driving. Active hours apply
+  to runs only.
+- **Output.** Markdown on stdout (progress on stderr); `--json` prints the structured result
+  instead; `--write` also saves the Markdown to `.nightshift/plan.md`. The streamed session is kept
+  in `.nightshift/plans/`. Exit code 0 on success, 1 on failure, 130 on Ctrl-C.
+
 ## Configuration
 
 `nightshift init` writes a commented `.nightshift/config.toml`. The important parts:
@@ -153,6 +189,7 @@ model = "opus"
 [budget]
 item_usd = 25                # all Claude steps of one item together
 invocation_usd = 150         # one `run` / `resume`
+plan_usd = 2                 # one `nightshift plan` (read-only preview)
 
 [usage]                      # Claude plan limits, see "Usage limits" below
 session_share = 15           # points of each 5-hour window nightshift may use (or --usage-share 15)
@@ -253,7 +290,9 @@ same name. Placeholders such as `{{pr_number}}` are checked: an unknown one is a
 `[agent.steps.<step>]` overrides `model`, `max_turns` and `permission_mode` for one step; anything it
 leaves out comes from `[agent]` (and with no `model` anywhere, Claude Code picks its default). The
 steps are `implement`, `address`, `fix_checks`, `resolve_conflicts` and `finalize`; any other name,
-key or value is a config error.
+key or value is a config error. `[agent.steps.plan]` sets `model` and `max_turns` for
+[`nightshift plan`](#previewing-the-next-items-nightshift-plan) (a cheap model is often enough);
+it takes no `permission_mode`, because a plan session is always read-only.
 
 ```toml
 [agent]
