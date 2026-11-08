@@ -2,7 +2,7 @@ import { accessSync, constants, existsSync } from "node:fs";
 import { statfs } from "node:fs/promises";
 import path from "node:path";
 import { loadSdkQuery, resolveClaudePath, toSdkExtraArgs } from "./agent/sdk.js";
-import { type Config, expandHome } from "./config.js";
+import { type Config, describeStepSettings, expandHome } from "./config.js";
 import { exec, shellQuote } from "./exec.js";
 import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { isActive, nextStart } from "./schedule.js";
@@ -68,6 +68,8 @@ export async function preflight(
       add("Agent SDK options", false, (error as Error).message);
     }
   }
+
+  add("agent steps", true, describeStepSettings(config.agent));
 
   for (const [alias, dir] of Object.entries(config.repos)) {
     if (!existsSync(dir)) {

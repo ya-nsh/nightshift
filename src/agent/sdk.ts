@@ -7,6 +7,12 @@ import type { Config } from "../config.js";
 import { INTERRUPT_GRACE_MS } from "../exec.js";
 import type { Agent, AgentRequest, AgentResult } from "../ports.js";
 import { toAgentEvents } from "./events.js";
+import {
+  DENIED_TOOLS,
+  READ_ONLY_PERMISSION_MODE,
+  READ_ONLY_TOOLS,
+  readOnlyExtraArgs,
+} from "./readonly.js";
 import { interpretResult } from "./result.js";
 
 export const SDK_PACKAGE = "@anthropic-ai/claude-agent-sdk";
@@ -103,24 +109,39 @@ export function buildSdkOptions(
   request: AgentRequest,
   abortController: AbortController,
 ): Record<string, unknown> {
-  const extraArgs = toSdkExtraArgs(config.extra_args);
+  const readOnly = request.readOnly === true;
+  const extraArgs = readOnly
+    ? {
+        ...toSdkExtraArgs(readOnlyExtraArgs(config.extra_args)),
+        // Passed as CLI flags so they hold whatever the installed SDK version supports.
+        tools: READ_ONLY_TOOLS.join(","),
+        "strict-mcp-config": null,
+      }
+    : toSdkExtraArgs(config.extra_args);
   const executable = resolveClaudePath(config.claude_path);
+  const addDirs = [...config.add_dirs, ...(request.addDirs ?? [])];
+  const permissionMode = readOnly
+    ? READ_ONLY_PERMISSION_MODE
+    : (request.permissionMode ?? config.permission_mode);
+  const model = request.model ?? config.model;
   return {
     cwd: request.cwd,
-    permissionMode: config.permission_mode,
-    ...(config.permission_mode === "bypassPermissions"
-      ? { allowDangerouslySkipPermissions: true }
-      : {}),
-    maxTurns: config.max_turns,
+    permissionMode,
+    ...(permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
+    maxTurns: request.maxTurns ?? config.max_turns,
     maxBudgetUsd: request.maxBudgetUsd,
     outputFormat: { type: "json_schema", schema: request.schema },
     // Load the same settings, CLAUDE.md files and skills as the CLI does.
     settingSources: ["user", "project", "local"],
     abortController,
-    ...(config.model === undefined ? {} : { model: config.model }),
+    ...(model === undefined ? {} : { model }),
     ...(request.resumeSessionId === undefined ? {} : { resume: request.resumeSessionId }),
-    ...(config.allowed_tools.length > 0 ? { allowedTools: config.allowed_tools } : {}),
-    ...(config.add_dirs.length > 0 ? { additionalDirectories: config.add_dirs } : {}),
+    ...(readOnly
+      ? { allowedTools: [...READ_ONLY_TOOLS], disallowedTools: [...DENIED_TOOLS] }
+      : config.allowed_tools.length > 0
+        ? { allowedTools: config.allowed_tools }
+        : {}),
+    ...(addDirs.length > 0 ? { additionalDirectories: addDirs } : {}),
     ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
     ...(executable === undefined ? {} : { pathToClaudeCodeExecutable: executable }),
   };

@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { z } from "zod";
-import type { Config } from "./config.js";
+import { type AgentStep, type Config, type StepSettings, stepSettings } from "./config.js";
 import { decideStart, estimateItem, readHistory } from "./forecast.js";
 import type {
   Agent,
@@ -50,6 +50,14 @@ const USAGE_READ_ATTEMPTS = 3;
 const USAGE_RETRY_MS = 5_000;
 /** While a step runs, progress is written to state.json at most this often. */
 const PROGRESS_SAVE_MS = 10_000;
+/** The `[agent.steps.<step>]` table each step template runs with. */
+const STEP_OF_TEMPLATE: Partial<Record<TemplateName, AgentStep>> = {
+  implement: "implement",
+  address: "address",
+  "fix-checks": "fix_checks",
+  "resolve-conflicts": "resolve_conflicts",
+  finalize: "finalize",
+};
 
 export interface PipelineDeps {
   config: Config;
@@ -670,8 +678,22 @@ export class Pipeline {
     // A fresh session is only for a first implement attempt; every later step resumes the item's
     // session so Claude keeps the context of this item (and only this item).
     const resume = item.sessionId;
-    this.log(item, `${template}${resume ? "" : " (fresh session)"} · budget $${left.toFixed(2)}`);
-    let call = await this.callAgent(item, template, prompt, schema, left, resume, gate.before);
+    // A resumed session may switch models between steps; Claude Code carries the context over.
+    const settings = stepSettings(this.deps.config.agent, STEP_OF_TEMPLATE[template]);
+    this.log(
+      item,
+      `${template}${resume ? "" : " (fresh session)"} · model ${settings.model ?? "default"} · budget $${left.toFixed(2)}`,
+    );
+    let call = await this.callAgent(
+      item,
+      template,
+      prompt,
+      schema,
+      settings,
+      left,
+      resume,
+      gate.before,
+    );
     if (
       call.cut === undefined &&
       call.result.outcome === "error" &&
@@ -691,6 +713,7 @@ export class Pipeline {
         template,
         prompt,
         schema,
+        settings,
         left - call.result.costUsd,
         undefined,
         again.before,
@@ -753,6 +776,7 @@ export class Pipeline {
     template: TemplateName,
     prompt: string,
     schema: z.ZodType,
+    settings: StepSettings,
     maxBudgetUsd: number,
     resumeSessionId: string | undefined,
     usageBefore: UsageWindows | undefined,
@@ -769,6 +793,9 @@ export class Pipeline {
         prompt,
         schema: toJsonSchema(schema),
         ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+        ...(settings.model === undefined ? {} : { model: settings.model }),
+        maxTurns: settings.maxTurns,
+        permissionMode: settings.permissionMode,
         maxBudgetUsd,
         artifactPath: this.artifact(item, `${template}-${attempt}.jsonl`),
         signal: watch === undefined ? this.signal : AbortSignal.any([this.signal, guard.signal]),
@@ -790,6 +817,7 @@ export class Pipeline {
       type: "agent",
       item: item.index,
       step: template,
+      ...(settings.model === undefined ? {} : { model: settings.model }),
       outcome: result.outcome,
       costUsd: result.costUsd,
       sessionId: result.sessionId,
@@ -1105,8 +1133,9 @@ export class Pipeline {
   }
 
   /**
-   * Live progress of a Claude step: every tool call is logged, and `status` sees the step, its
-   * tool count and the latest call (state is saved at most every PROGRESS_SAVE_MS while it runs).
+   * Live progress of a Claude step: every tool call is logged and appended to the run's progress
+   * feed (for `watch`), and `status` sees the step, its tool count and the latest call (state is
+   * saved at most every PROGRESS_SAVE_MS while it runs).
    */
   private trackActivity(
     item: ItemState,
@@ -1124,6 +1153,16 @@ export class Pipeline {
         activity.last = detail === "" ? name : `${name} ${detail}`;
         activity.lastAt = now().toISOString();
         this.log(item, `${template} · ${activity.last}`);
+        // The feed is only for `nightshift watch`; failing to write it must not fail the step.
+        this.deps.store
+          .progress(this.state.runId, {
+            at: activity.lastAt,
+            item: item.index,
+            step: template,
+            tool: name,
+            detail,
+          })
+          .catch(() => {});
         if (now().getTime() - lastSave >= PROGRESS_SAVE_MS) {
           lastSave = now().getTime();
           this.save().catch(() => {});

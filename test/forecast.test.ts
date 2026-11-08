@@ -20,6 +20,7 @@ import type { AgentRequest } from "../src/ports.js";
 import { parseRange, type TimeRange } from "../src/schedule.js";
 import type { RunState } from "../src/state.js";
 import { usageLimits } from "../src/usage.js";
+import { describeEvent } from "../src/watch.js";
 import {
   FakeAgent,
   FIVE_HOURS_MS,
@@ -298,6 +299,21 @@ describe("deciding whether a new item fits", () => {
     expect(describeForecast(ctx({ estimate: estimateItem([]) }))).toEqual([
       "not enough history to forecast yet (0 finished items; need 3)",
     ]);
+  });
+});
+
+describe("forecast events in nightshift watch", () => {
+  it("describes forecasts and forecast waits", () => {
+    expect(
+      describeEvent({ at: "", type: "forecast", item: 2, start: false, reason: "too big" }),
+    ).toEqual({ text: "item 2 · forecast: too big", style: "yellow" });
+    expect(
+      describeEvent({ at: "", type: "forecast", item: 2, start: true, reason: "fits" }),
+    ).toEqual({ text: "item 2 · forecast: fits" });
+    expect(
+      describeEvent({ at: "", type: "forecast_wait", reason: "forecast: x", until: "nonsense" })
+        .text,
+    ).toMatch(/^waiting until .*: forecast: x$/);
   });
 });
 

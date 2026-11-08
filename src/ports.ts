@@ -3,6 +3,8 @@
  * in-memory fakes and the real adapters stay thin.
  */
 
+import type { PermissionMode } from "./config.js";
+
 export interface AgentRequest {
   /** Working directory for the session (the repo the item runs in). */
   cwd: string;
@@ -19,6 +21,21 @@ export interface AgentRequest {
   signal: AbortSignal;
   /** Progress while the step runs: tool calls, and plan usage when Claude reports it. */
   onEvent?: (event: AgentEvent) => void;
+  /**
+   * This step's effective settings (`[agent.steps.<step>]` over `[agent]`). Each one left out falls
+   * back to the backend's `[agent]` config; `model` left out there too means Claude Code's default.
+   */
+  model?: string;
+  maxTurns?: number;
+  /** Ignored when `readOnly` is set. */
+  permissionMode?: PermissionMode;
+  /**
+   * Run the session read-only (`nightshift plan`): only the Read, Glob and Grep tools exist, nothing
+   * else may be approved, MCP servers and the config's own tool and permission settings are left out.
+   */
+  readOnly?: boolean;
+  /** More directories the session may use, besides `cwd` and `agent.add_dirs`. */
+  addDirs?: string[];
 }
 
 export type AgentEvent =

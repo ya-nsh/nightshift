@@ -9,6 +9,8 @@ runs/
 state.json
 lock
 STOP
+plan.md
+plans/
 `;
 
 export function configTemplate(alias: string, ejectedPrompts: boolean): string {
@@ -31,9 +33,20 @@ max_turns = 200                   # per Claude step
 # add_dirs = [".."]               # extra directories Claude may touch (e.g. sibling worktrees)
 # extra_args = []                 # appended to every \`claude -p\` call (cli backend)
 
+# Per-step overrides of model, max_turns and permission_mode; anything unset falls back to [agent].
+# Steps: implement, address, fix_checks, resolve_conflicts, finalize.
+# [agent.steps.implement]
+# model = "opus"
+# [agent.steps.address]
+# model = "sonnet"
+# [agent.steps.fix_checks]
+# model = "sonnet"
+# max_turns = 80
+
 [budget]
 item_usd = 25                     # ceiling for all Claude steps of one item
 invocation_usd = 150              # ceiling for one \`nightshift run\` / \`resume\`
+plan_usd = 2                      # ceiling for one \`nightshift plan\` (read-only preview)
 
 [review]
 # Runs after the PR opens; its output goes to Claude, which addresses the comments.
