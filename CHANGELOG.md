@@ -15,6 +15,37 @@
   `resume` removes the label, and `run --force` releases the claim. `nightshift run` needs no
   `--prompt` with this source (one given adds instructions to every issue), and `doctor` and
   `status` show the task source and the next issue.
+- **Models per step.** `[agent.steps.<step>]` (`implement`, `address`, `fix_checks`,
+  `resolve_conflicts`, `finalize`) overrides `model`, `max_turns` and `permission_mode` for that
+  step, falling back to `[agent]`; e.g. `implement` on opus, `address` and `fix_checks` on sonnet.
+  Unknown steps and bad values are config errors. Both backends apply them, `nightshift doctor`
+  lists each step's model, step log lines name the model, and `agent` events record it.
+- **`nightshift watch`.** A live terminal view of a run driven elsewhere (another terminal, a
+  background service): run status and whether its process is alive, the current item, phase and
+  PR, the running step with elapsed time, tool count and its latest tool calls, cost, 5-hour and
+  weekly usage bars with nightshift's share and reset times, any wait, and the last ten events.
+  It only reads `.nightshift/`, cuts lines to the terminal width, respects `NO_COLOR`, prints
+  line by line when the output is not a terminal, and quits on `q` / Ctrl-C. `--once` prints one
+  frame. Each tool call is now also appended to `.nightshift/runs/<run-id>/progress.jsonl`
+  (rotated at 256 KiB, one older file kept).
+- **`nightshift plan`.** A dry run: a fresh, read-only Claude session lists the next N items
+  (`-n`, default 5) nightshift would do, from the current run's pending handoff, `--prompt` /
+  `--prompt-file`, or the repositories' instructions. Each item has an ID, title, repo, why now,
+  rough size, risk, and whether it needs a human (with the question). `--json` prints the
+  structured result, `--write` saves `.nightshift/plan.md`. The session has only the Read, Glob
+  and Grep tools, runs in `dontAsk` mode without MCP servers, and ignores the configured tool and
+  permission settings. `[agent.steps.plan]` sets its `model` and `max_turns` (its permission
+  mode is always read-only). It costs at most `[budget] plan_usd` (default $2), refuses to start
+  at a `[usage]` limit, and takes no lock, so it is safe next to a live run.
+- **Forecasts.** From finished items (this run's and earlier runs' `item_done` events), nightshift
+  estimates a typical item's usage points, active time and cost (median of the last 20 items by
+  default, `[usage] forecast_percentile`; at least 3 items). Before starting a new item it checks
+  that one fits in what is left of the `[usage]` shares and maxima and of the active hours, and
+  otherwise waits for the reset or the next active range (or pauses, per `on_limit` /
+  `outside_hours`) instead of starting an item that would be cut half-way, logging why.
+  `[usage] start_item_only_if_it_fits` (default: on when limits or active hours are set).
+  `nightshift status` and `doctor` show how many more items fit. `item_done` events now record
+  `usagePoints` and `activeMs`.
 
 ## 0.3.0 — 2026-11-08
 

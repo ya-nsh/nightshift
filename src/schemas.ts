@@ -84,6 +84,68 @@ export const finalizeIssueResult = z.strictObject({
 });
 export type FinalizeIssueResult = z.infer<typeof finalizeIssueResult>;
 
+export const PLAN_SIZES = ["S", "M", "L", "XL"] as const;
+export const PLAN_RISKS = ["low", "medium", "high"] as const;
+
+/** `nightshift plan`: the next `count` items nightshift would work on, without doing any of them. */
+export function planResult(repoAliases: readonly [string, ...string[]], count: number) {
+  const item = z
+    .strictObject({
+      id: z
+        .string()
+        .min(1)
+        .describe("The task's ID in the repository's todo list (e.g. T12), or a short slug."),
+      title: z.string().min(1).describe("The task's title, in a few words."),
+      repo: z.enum(repoAliases).describe("Alias of the repository the task runs in."),
+      why_now: z
+        .string()
+        .min(1)
+        .describe(
+          "Why this task comes next: the rule, order, dependency or priority that puts it here.",
+        ),
+      size: z
+        .enum(PLAN_SIZES)
+        .describe(
+          "Rough size for one unattended session. S: a small change, under an hour. M: a few hours. L: about a day. XL: more than a day; it should probably be split.",
+        ),
+      risk: z
+        .enum(PLAN_RISKS)
+        .describe(
+          "How likely it is to go wrong or break something: low, medium or high (migrations, auth, money, public APIs, wide refactors).",
+        ),
+      risk_note: z
+        .string()
+        .optional()
+        .describe("When risk is not low: what could go wrong, in one sentence."),
+      needs_human: z
+        .boolean()
+        .describe(
+          "Whether a human must act or decide before or during this task (credentials, accounts, money, a product decision, anything the instructions reserve for the user).",
+        ),
+      question: z
+        .string()
+        .optional()
+        .describe("Required when needs_human is true: the precise question for the human."),
+    })
+    .refine((i) => !i.needs_human || (i.question ?? "").trim() !== "", {
+      message: "needs_human items need a question",
+      path: ["question"],
+    });
+  return z.strictObject({
+    summary: z
+      .string()
+      .describe("One or two sentences: where the work stands and what the next tasks are about."),
+    items: z
+      .array(item)
+      .max(count)
+      .describe(
+        `The next tasks in the order nightshift would do them, at most ${count}; fewer, or none, when fewer are left.`,
+      ),
+  });
+}
+export type PlanResult = z.infer<ReturnType<typeof planResult>>;
+export type PlanItem = PlanResult["items"][number];
+
 /** JSON Schema for a result schema, in the form both the CLI and the SDK accept. */
 export function toJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const { $schema: _ignored, ...json } = z.toJSONSchema(schema) as Record<string, unknown>;

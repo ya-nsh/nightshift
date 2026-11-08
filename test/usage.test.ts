@@ -92,6 +92,7 @@ describe("usage config", () => {
       weekly_max: 0,
       on_limit: "wait",
       check_seconds: 60,
+      forecast_percentile: 50,
     });
     expect(() => parseConfig('[repos]\na = "."\n[usage]\nsession_share = 101', "/h")).toThrow(
       ConfigError,

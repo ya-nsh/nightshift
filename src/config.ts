@@ -31,6 +31,45 @@ export type TaskSource = (typeof TASK_SOURCES)[number];
 
 export const PERMISSION_MODES = ["auto", "acceptEdits", "dontAsk", "bypassPermissions"] as const;
 export const MERGE_METHODS = ["merge", "rebase", "squash"] as const;
+export type PermissionMode = (typeof PERMISSION_MODES)[number];
+
+/** The Claude steps of an item whose agent settings `[agent.steps.<step>]` can override. */
+export const AGENT_STEPS = [
+  "implement",
+  "address",
+  "fix_checks",
+  "resolve_conflicts",
+  "finalize",
+] as const;
+export type AgentStep = (typeof AGENT_STEPS)[number];
+
+/** One `[agent.steps.<step>]` table: unset keys fall back to `[agent]`. */
+const stepOverride = z.strictObject({
+  model: z.string().trim().min(1, "model must not be empty").optional(),
+  max_turns: z.number().int().positive().optional(),
+  permission_mode: z.enum(PERMISSION_MODES).optional(),
+});
+
+/** `[agent.steps.plan]` (`nightshift plan`): no permission_mode, the plan session is always read-only. */
+const planOverride = stepOverride.omit({ permission_mode: true });
+
+const agentSteps = z
+  .strictObject(
+    {
+      ...(Object.fromEntries(AGENT_STEPS.map((step) => [step, stepOverride.optional()])) as Record<
+        AgentStep,
+        z.ZodOptional<typeof stepOverride>
+      >),
+      plan: planOverride.optional(),
+    },
+    {
+      error: (issue) =>
+        issue.code === "unrecognized_keys"
+          ? `unknown step${issue.keys.length === 1 ? "" : "s"} ${issue.keys.map((k) => `"${k}"`).join(", ")}; steps are ${AGENT_STEPS.join(", ")}, plan`
+          : undefined,
+    },
+  )
+  .default({});
 
 const configSchema = z.strictObject({
   default_repo: repoAlias.optional(),
@@ -47,12 +86,15 @@ const configSchema = z.strictObject({
       add_dirs: z.array(z.string().min(1)).default([]),
       max_turns: z.number().int().positive().default(200),
       extra_args: z.array(z.string()).default([]),
+      steps: agentSteps,
     })
     .prefault({}),
   budget: z
     .strictObject({
       item_usd: z.number().positive().default(25),
       invocation_usd: z.number().positive().default(150),
+      /** Ceiling for one `nightshift plan` session. */
+      plan_usd: z.number().positive().default(2),
     })
     .prefault({}),
   review: z
@@ -95,6 +137,9 @@ const configSchema = z.strictObject({
       weekly_max: percent.default(0),
       on_limit: z.enum(["wait", "halt"]).default("wait"),
       check_seconds: z.number().int().min(10).max(3600).default(60),
+      /** Unset: on when usage limits or active hours are set. */
+      start_item_only_if_it_fits: z.boolean().optional(),
+      forecast_percentile: z.number().int().min(50).max(100).default(50),
     })
     .prefault({}),
   schedule: z
@@ -222,6 +267,51 @@ function validateTasks(tasks: Config["tasks"], aliases: string[]): string[] {
     issues.push("an issue must be claimed somehow: set assign = true or an in_progress_label");
   }
   return issues;
+}
+
+/** The agent settings one Claude step runs with. */
+export interface StepSettings {
+  /** undefined: Claude Code's default model. */
+  model: string | undefined;
+  maxTurns: number;
+  permissionMode: PermissionMode;
+}
+
+/**
+ * The effective settings for `step`: its `[agent.steps.<step>]` overrides on top of `[agent]`.
+ * Without a step (a Claude call that is not one of an item's steps) `[agent]` applies as is.
+ */
+export function stepSettings(agent: Config["agent"], step: AgentStep | undefined): StepSettings {
+  const override = step === undefined ? undefined : agent.steps[step];
+  return {
+    model: override?.model ?? agent.model,
+    maxTurns: override?.max_turns ?? agent.max_turns,
+    permissionMode: override?.permission_mode ?? agent.permission_mode,
+  };
+}
+
+/**
+ * The model and max_turns of `nightshift plan`: `[agent.steps.plan]` on top of `[agent]`. Its
+ * permission mode is not configurable; the session is always read-only.
+ */
+export function planSettings(agent: Config["agent"]): Omit<StepSettings, "permissionMode"> {
+  const override = agent.steps.plan;
+  return {
+    model: override?.model ?? agent.model,
+    maxTurns: override?.max_turns ?? agent.max_turns,
+  };
+}
+
+/** Every step's model, plus any max_turns/permission_mode override, for `nightshift doctor`. */
+export function describeStepSettings(agent: Config["agent"]): string {
+  return AGENT_STEPS.map((step) => {
+    const settings = stepSettings(agent, step);
+    const extras = [
+      settings.maxTurns === agent.max_turns ? "" : `max_turns ${settings.maxTurns}`,
+      settings.permissionMode === agent.permission_mode ? "" : settings.permissionMode,
+    ].filter((extra) => extra !== "");
+    return `${step} ${settings.model ?? "default"}${extras.length > 0 ? ` (${extras.join(", ")})` : ""}`;
+  }).join(" · ");
 }
 
 export function expandHome(p: string): string {

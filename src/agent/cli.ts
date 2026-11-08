@@ -4,6 +4,12 @@ import type { Config } from "../config.js";
 import { exec, tail } from "../exec.js";
 import type { Agent, AgentRequest, AgentResult } from "../ports.js";
 import { toAgentEvents } from "./events.js";
+import {
+  DENIED_TOOLS,
+  READ_ONLY_PERMISSION_MODE,
+  READ_ONLY_TOOLS,
+  readOnlyExtraArgs,
+} from "./readonly.js";
 import { interpretResult } from "./result.js";
 
 type AgentConfig = Config["agent"];
@@ -61,6 +67,8 @@ export class ClaudeCliAgent implements Agent {
 }
 
 export function buildCliArgs(config: AgentConfig, request: AgentRequest): string[] {
+  const readOnly = request.readOnly === true;
+  const model = request.model ?? config.model;
   const args = [
     "-p",
     "--output-format",
@@ -69,19 +77,27 @@ export function buildCliArgs(config: AgentConfig, request: AgentRequest): string
     "--json-schema",
     JSON.stringify(request.schema),
     "--permission-mode",
-    config.permission_mode,
+    readOnly ? READ_ONLY_PERMISSION_MODE : (request.permissionMode ?? config.permission_mode),
     "--max-turns",
-    String(config.max_turns),
+    String(request.maxTurns ?? config.max_turns),
     "--max-budget-usd",
     request.maxBudgetUsd.toFixed(2),
   ];
-  if (config.model !== undefined) args.push("--model", config.model);
+  if (model !== undefined) args.push("--model", model);
   if (request.resumeSessionId !== undefined) args.push("--resume", request.resumeSessionId);
   // Variadic flags use the `=` form so they cannot swallow the arguments that follow.
-  if (config.allowed_tools.length > 0)
+  if (readOnly) {
+    args.push(
+      `--tools=${READ_ONLY_TOOLS.join(",")}`,
+      `--allowedTools=${READ_ONLY_TOOLS.join(",")}`,
+      `--disallowedTools=${DENIED_TOOLS.join(",")}`,
+      "--strict-mcp-config",
+    );
+  } else if (config.allowed_tools.length > 0) {
     args.push(`--allowedTools=${config.allowed_tools.join(",")}`);
-  for (const dir of config.add_dirs) args.push(`--add-dir=${dir}`);
-  args.push(...config.extra_args);
+  }
+  for (const dir of [...config.add_dirs, ...(request.addDirs ?? [])]) args.push(`--add-dir=${dir}`);
+  args.push(...(readOnly ? readOnlyExtraArgs(config.extra_args) : config.extra_args));
   return args;
 }
 

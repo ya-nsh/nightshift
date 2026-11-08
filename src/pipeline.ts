@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { z } from "zod";
-import type { Config } from "./config.js";
+import { type AgentStep, type Config, type StepSettings, stepSettings } from "./config.js";
+import { decideStart, estimateItem, readHistory } from "./forecast.js";
 import {
   BLOCKED_COLOR,
   BLOCKED_DESCRIPTION,
@@ -62,6 +63,14 @@ const USAGE_READ_ATTEMPTS = 3;
 const USAGE_RETRY_MS = 5_000;
 /** While a step runs, progress is written to state.json at most this often. */
 const PROGRESS_SAVE_MS = 10_000;
+/** The `[agent.steps.<step>]` table each step template runs with. */
+const STEP_OF_TEMPLATE: Partial<Record<TemplateName, AgentStep>> = {
+  implement: "implement",
+  address: "address",
+  "fix-checks": "fix_checks",
+  "resolve-conflicts": "resolve_conflicts",
+  finalize: "finalize",
+};
 
 export interface PipelineDeps {
   config: Config;
@@ -167,6 +176,10 @@ export class Pipeline {
   private invocationCostUsd = 0;
   private itemsThisInvocation = 0;
   private signal: AbortSignal = new AbortController().signal;
+  /** Time spent in usage, schedule and forecast waits, so item time can leave it out. */
+  private waitedMs = 0;
+  /** When the running step started, and `waitedMs` then. */
+  private stepClock: { at: number; waited: number } | undefined;
 
   constructor(
     private readonly deps: PipelineDeps,
@@ -211,8 +224,9 @@ export class Pipeline {
         let current = this.state.item;
         if (current === undefined) {
           if (!this.fromIssues()) return await this.finish("no task left");
-          const picked = await this.pickIssue();
+          const picked = await this.startNextIssue();
           if (typeof picked === "string") return await this.finish(picked);
+          if (!("index" in picked)) return picked.exit;
           current = picked;
         }
         const exit = await this.step(current);
@@ -258,10 +272,28 @@ export class Pipeline {
     const restarted = item.inFlight === item.phase || item.interruptedPhase === item.phase;
     item.inFlight = item.phase;
     await this.save();
-    const exit = await this.runPhase(item, restarted);
+    this.stepClock = { at: this.deps.host.now().getTime(), waited: this.waitedMs };
+    let exit: Exit | undefined;
+    try {
+      exit = await this.runPhase(item, restarted);
+    } finally {
+      // A finished item already counted its time (completeItem); only a current one adds it.
+      if (this.state.item === item) item.activeMs = this.activeMs(item);
+      this.stepClock = undefined;
+    }
     delete item.inFlight;
     await this.save();
     return exit;
+  }
+
+  /** The item's active time, including the running step so far (without its waits). */
+  private activeMs(item: ItemState): number {
+    const clock = this.stepClock;
+    const step =
+      clock === undefined
+        ? 0
+        : this.deps.host.now().getTime() - clock.at - (this.waitedMs - clock.waited);
+    return Math.max(0, Math.round((item.activeMs ?? 0) + step));
   }
 
   private runPhase(item: ItemState, restarted: boolean): Promise<Exit | undefined> {
@@ -676,18 +708,52 @@ export class Pipeline {
   }
 
   /**
+   * Starts the next issue item, but only once a new item may start: inside active hours, within
+   * the usage limits and, with forecasts, when a typical item fits. Those gates run before the
+   * issue is claimed, so a wait or pause never holds a claim; implement then does not repeat the
+   * forecast. Returns why there is no issue left, or the exit a gate took.
+   */
+  private async startNextIssue(): Promise<ItemState | string | { exit: Exit }> {
+    const ready = await this.issueQueue();
+    if (ready.queue.length === 0) return ready.none;
+    const index = (this.state.issues?.picked ?? this.state.itemsCompleted) + 1;
+    const upcoming = newItem(index, this.deps.config.tasks.repo, "");
+    upcoming.label = "next issue";
+    const gate = await this.gates(upcoming);
+    if (!gate.ok) return { exit: gate.exit };
+    const picked = await this.pickIssue();
+    if (typeof picked !== "string") picked.startedAt = this.deps.host.now().toISOString();
+    return picked;
+  }
+
+  /** The issues nightshift may pick now, best first, and what to say when there are none. */
+  private async issueQueue(): Promise<{ slug: string; me: string; queue: Issue[]; none: string }> {
+    const { forge, config } = this.deps;
+    const { tasks } = config;
+    const slug = await forge.repoSlug(this.repoDir(tasks.repo));
+    const me = await forge.currentUser();
+    const exclude = new Set(this.state.issues?.skipped ?? []);
+    const { queue } = rankIssues(await forge.listIssues(slug, tasks.label), tasks, me, exclude);
+    return {
+      slug,
+      me,
+      queue,
+      none: `no open issue labelled "${tasks.label}" is left to do in ${slug}`,
+    };
+  }
+
+  /**
    * Picks the next open issue, makes it the current item and claims it. Returns why there is none
    * when no issue is left.
    */
   private async pickIssue(): Promise<ItemState | string> {
     const { forge, config } = this.deps;
     const { tasks } = config;
-    const slug = await forge.repoSlug(this.repoDir(tasks.repo));
-    const me = await forge.currentUser();
+    // Listed again: a gate before this may have waited for hours.
+    const { slug, me, queue, none } = await this.issueQueue();
     this.state.issues ??= {};
     const runIssues = this.state.issues;
     const exclude = new Set(runIssues.skipped ?? []);
-    const { queue } = rankIssues(await forge.listIssues(slug, tasks.label), tasks, me, exclude);
     for (const candidate of queue) {
       // The listing has no bodies, and the issue may have changed since: read it again.
       const issue = await forge.issue(slug, candidate.number);
@@ -728,7 +794,7 @@ export class Pipeline {
       delete this.state.item;
       await this.save();
     }
-    return `no open issue labelled "${tasks.label}" is left to do in ${slug}`;
+    return none;
   }
 
   /**
@@ -936,8 +1002,12 @@ export class Pipeline {
       };
     }
 
-    const gate = await this.gates();
+    // A new item (not a restart or resume of one already under way) starts only if the forecast
+    // says it fits in what is left of the usage limits and the active hours.
+    const fresh = template === "implement" && !restarted && item.startedAt === undefined;
+    const gate = await this.gates(fresh ? item : undefined);
     if (!gate.ok) return gate;
+    if (fresh) item.startedAt = this.deps.host.now().toISOString();
     // Cleared only once the step really starts again, so a pause before then keeps the restart.
     delete item.interruptedPhase;
 
@@ -961,8 +1031,22 @@ export class Pipeline {
     // A fresh session is only for a first implement attempt; every later step resumes the item's
     // session so Claude keeps the context of this item (and only this item).
     const resume = item.sessionId;
-    this.log(item, `${template}${resume ? "" : " (fresh session)"} · budget $${left.toFixed(2)}`);
-    let call = await this.callAgent(item, template, prompt, schema, left, resume, gate.before);
+    // A resumed session may switch models between steps; Claude Code carries the context over.
+    const settings = stepSettings(this.deps.config.agent, STEP_OF_TEMPLATE[template]);
+    this.log(
+      item,
+      `${template}${resume ? "" : " (fresh session)"} · model ${settings.model ?? "default"} · budget $${left.toFixed(2)}`,
+    );
+    let call = await this.callAgent(
+      item,
+      template,
+      prompt,
+      schema,
+      settings,
+      left,
+      resume,
+      gate.before,
+    );
     if (
       call.cut === undefined &&
       call.result.outcome === "error" &&
@@ -982,6 +1066,7 @@ export class Pipeline {
         template,
         prompt,
         schema,
+        settings,
         left - call.result.costUsd,
         undefined,
         again.before,
@@ -1044,6 +1129,7 @@ export class Pipeline {
     template: TemplateName,
     prompt: string,
     schema: z.ZodType,
+    settings: StepSettings,
     maxBudgetUsd: number,
     resumeSessionId: string | undefined,
     usageBefore: UsageWindows | undefined,
@@ -1060,6 +1146,9 @@ export class Pipeline {
         prompt,
         schema: toJsonSchema(schema),
         ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+        ...(settings.model === undefined ? {} : { model: settings.model }),
+        maxTurns: settings.maxTurns,
+        permissionMode: settings.permissionMode,
         maxBudgetUsd,
         artifactPath: this.artifact(item, `${template}-${attempt}.jsonl`),
         signal: watch === undefined ? this.signal : AbortSignal.any([this.signal, guard.signal]),
@@ -1081,6 +1170,7 @@ export class Pipeline {
       type: "agent",
       item: item.index,
       step: template,
+      ...(settings.model === undefined ? {} : { model: settings.model }),
       outcome: result.outcome,
       costUsd: result.costUsd,
       sessionId: result.sessionId,
@@ -1156,14 +1246,93 @@ export class Pipeline {
    * Everything that must hold before Claude work starts: inside active hours and within the usage
    * limits. A long usage wait can end outside active hours, so both are checked until both hold.
    */
-  private async gates(): Promise<UsageGate> {
+  private async gates(newItem?: ItemState): Promise<UsageGate> {
     for (;;) {
       const outside = await this.scheduleGate();
       if (outside) return { ok: false, exit: outside };
       const gate = await this.usageGate();
       if (!gate.ok) return gate;
-      if (isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) return gate;
+      if (!isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) continue;
+      if (newItem === undefined) return gate;
+      const fit = await this.forecastGate(newItem, gate.before);
+      if (fit === undefined) return gate;
+      if (fit !== "waited") return { ok: false, exit: fit };
     }
+  }
+
+  /** `[usage] start_item_only_if_it_fits`, which defaults to on when limits or hours are set. */
+  private forecastEnabled(): boolean {
+    const { usage, schedule } = this.deps.config;
+    return (
+      usage.start_item_only_if_it_fits ??
+      (limitsEnabled(this.usageLimits()) || schedule.active_hours.length > 0)
+    );
+  }
+
+  /**
+   * Before a new item: estimates a typical item from history and, when it would not fit in what is
+   * left of the usage limits or the active hours, waits for the window reset or the next active
+   * range (or pauses, following on_limit / outside_hours) instead of starting an item that would
+   * be cut half-way. Returns undefined to start, "waited" to check everything again, or an exit.
+   */
+  private async forecastGate(
+    item: ItemState,
+    windows: UsageWindows | undefined,
+  ): Promise<Exit | "waited" | undefined> {
+    if (!this.forecastEnabled()) return undefined;
+    const { usage, schedule, dir } = this.deps.config;
+    const now = this.deps.host.now();
+    const estimate = estimateItem(await readHistory(dir), usage.forecast_percentile);
+    const decision = decideStart({
+      estimate,
+      limits: this.usageLimits(),
+      tally: this.state.usage?.tally ?? {},
+      windows,
+      ranges: schedule.active_hours,
+      now,
+    });
+    this.log(item, `forecast: ${decision.reason}`);
+    await this.event({
+      type: "forecast",
+      item: item.index,
+      start: decision.start,
+      reason: decision.reason,
+    });
+    if (decision.start) return undefined;
+
+    let stopped: Exit | undefined;
+    if (decision.kind === "usage") {
+      const label = WINDOW_LABEL[decision.window];
+      if (usage.on_limit === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before the ${label} window resets ${formatTime(decision.until, now)}`,
+        );
+      }
+      const resetsAt = decision.until === undefined ? Number.NaN : Date.parse(decision.until);
+      const until = Math.max(
+        Number.isNaN(resetsAt) ? 0 : resetsAt + USAGE_RESET_GRACE_MS,
+        now.getTime() + usage.check_seconds * 1000,
+      );
+      stopped = await this.sleepUntil(
+        until,
+        `forecast: ${decision.reason}`,
+        `for the ${label} window to reset before starting a new item`,
+        "forecast_wait",
+      );
+    } else {
+      if (schedule.outside_hours === "halt") {
+        return this.pause(
+          `forecast: ${decision.reason}; not starting a new item before active hours start again ${formatTime(decision.until.toISOString(), now)}`,
+        );
+      }
+      stopped = await this.sleepUntil(
+        decision.until.getTime(),
+        `forecast: ${decision.reason}`,
+        "for the next active hours before starting a new item",
+        "forecast_wait",
+      );
+    }
+    return stopped ?? "waited";
   }
 
   /**
@@ -1199,9 +1368,11 @@ export class Pipeline {
     this.state.waiting = { until: untilIso, reason };
     await this.save();
     await this.event({ type: eventType, reason, until: untilIso });
+    const started = this.deps.host.now().getTime();
     try {
       return await this.waitUntil(until);
     } finally {
+      this.waitedMs += Math.max(0, this.deps.host.now().getTime() - started);
       delete this.state.waiting;
       await this.save();
     }
@@ -1315,8 +1486,9 @@ export class Pipeline {
   }
 
   /**
-   * Live progress of a Claude step: every tool call is logged, and `status` sees the step, its
-   * tool count and the latest call (state is saved at most every PROGRESS_SAVE_MS while it runs).
+   * Live progress of a Claude step: every tool call is logged and appended to the run's progress
+   * feed (for `watch`), and `status` sees the step, its tool count and the latest call (state is
+   * saved at most every PROGRESS_SAVE_MS while it runs).
    */
   private trackActivity(
     item: ItemState,
@@ -1334,6 +1506,16 @@ export class Pipeline {
         activity.last = detail === "" ? name : `${name} ${detail}`;
         activity.lastAt = now().toISOString();
         this.log(item, `${template} · ${activity.last}`);
+        // The feed is only for `nightshift watch`; failing to write it must not fail the step.
+        this.deps.store
+          .progress(this.state.runId, {
+            at: activity.lastAt,
+            item: item.index,
+            step: template,
+            tool: name,
+            detail,
+          })
+          .catch(() => {});
         if (now().getTime() - lastSave >= PROGRESS_SAVE_MS) {
           lastSave = now().getTime();
           this.save().catch(() => {});
@@ -1400,6 +1582,15 @@ export class Pipeline {
       pr: item.pr?.url,
       mergeSha: item.mergeSha,
       costUsd: item.costUsd,
+      // For forecasts: what the item used of each window (when usage is measured), and its time.
+      ...(limitsEnabled(this.usageLimits())
+        ? {
+            usagePoints: Object.fromEntries(
+              USAGE_WINDOWS.map((w) => [w, item.usagePoints?.[w] ?? 0]),
+            ),
+          }
+        : {}),
+      activeMs: this.activeMs(item),
     });
   }
 

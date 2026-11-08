@@ -2,8 +2,9 @@ import { accessSync, constants, existsSync } from "node:fs";
 import { statfs } from "node:fs/promises";
 import path from "node:path";
 import { loadSdkQuery, resolveClaudePath, toSdkExtraArgs } from "./agent/sdk.js";
-import { type Config, expandHome } from "./config.js";
+import { type Config, describeStepSettings, expandHome } from "./config.js";
 import { exec, shellQuote } from "./exec.js";
+import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { GhForge } from "./github.js";
 import { describeQueue } from "./issues.js";
 import { isActive, nextStart } from "./schedule.js";
@@ -69,6 +70,8 @@ export async function preflight(
       add("Agent SDK options", false, (error as Error).message);
     }
   }
+
+  add("agent steps", true, describeStepSettings(config.agent));
 
   for (const [alias, dir] of Object.entries(config.repos)) {
     if (!existsSync(dir)) {
@@ -163,6 +166,21 @@ export async function preflight(
         : `not available (${reading.detail}); fine, no [usage] limits are set`,
     );
   }
+
+  // Informational: what a typical item uses, and how many more fit now.
+  const forecast = describeForecast({
+    estimate: estimateItem(await readHistory(config.dir), config.usage.forecast_percentile),
+    limits,
+    tally: usage.tally ?? {},
+    windows: reading.ok ? reading.windows : undefined,
+    ranges: hours,
+    now: new Date(),
+  });
+  const fitting =
+    (config.usage.start_item_only_if_it_fits ?? (enforced || hours.length > 0))
+      ? "new items start only if they fit"
+      : "start_item_only_if_it_fits is off";
+  add("forecast", true, `${forecast.join(" · ")} · ${fitting}`);
 
   const stats = await statfs(config.home);
   const freeGb = (Number(stats.bavail) * Number(stats.bsize)) / 1e9;

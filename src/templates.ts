@@ -12,6 +12,7 @@ export const TEMPLATE_NAMES = [
   "finalize-issue",
   "answer",
   "restarted",
+  "plan",
 ] as const;
 export type TemplateName = (typeof TEMPLATE_NAMES)[number];
 

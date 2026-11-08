@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { UsageWindows } from "./ports.js";
 import type { UsageTally, UsageWindow } from "./usage.js";
@@ -55,6 +55,10 @@ export interface ItemState {
   pendingQuestion?: string;
   pendingAnswer?: string;
   costUsd: number;
+  /** When the item's first implement step started (after the forecast let it start). */
+  startedAt?: string;
+  /** Time spent on the item so far, without usage/schedule waits and pauses (for forecasts). */
+  activeMs?: number;
   /** Percentage points of each usage window this item's steps used (when usage is measured). */
   usagePoints?: Partial<Record<UsageWindow, number>>;
   /** The Claude step running right now, for `status`. */
@@ -123,6 +127,21 @@ export interface UsageState {
   last?: { at: string; windows: UsageWindows };
 }
 
+/** One tool call of a Claude step, as appended to a run's progress feed for `nightshift watch`. */
+export interface ProgressEntry {
+  at: string;
+  item: number;
+  step: string;
+  tool: string;
+  detail: string;
+}
+
+export const PROGRESS_FILE = "progress.jsonl";
+/** The previous progress feed, kept after a rotation. */
+export const PROGRESS_ROTATED_FILE = "progress.1.jsonl";
+/** The progress feed rotates when it grows past this, so it stays bounded at about twice this. */
+export const PROGRESS_MAX_BYTES = 256 * 1024;
+
 export function newRunId(now: Date): string {
   const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
   return `${stamp}-${randomBytes(2).toString("hex")}`;
@@ -132,6 +151,8 @@ export function newRunId(now: Date): string {
 export class StateStore {
   /** Saves run one after another: a usage check and progress updates may save during a step. */
   private saving: Promise<void> = Promise.resolve();
+  /** Appends to the progress feed one after another, so a rotation never races an append. */
+  private feeding: Promise<void> = Promise.resolve();
 
   constructor(readonly dir: string) {}
 
@@ -181,6 +202,25 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const line = JSON.stringify({ at: new Date().toISOString(), ...event });
     await appendFile(path.join(dir, "events.jsonl"), `${line}\n`);
+  }
+
+  /**
+   * Appends a tool call to the run's progress feed. The feed is bounded: past `maxBytes` the file
+   * becomes `progress.1.jsonl` (replacing the one before) and a new one starts.
+   */
+  progress(runId: string, entry: ProgressEntry, maxBytes = PROGRESS_MAX_BYTES): Promise<void> {
+    const line = `${JSON.stringify(entry)}\n`;
+    const dir = this.runDir(runId);
+    const next = this.feeding.then(async () => {
+      await mkdir(dir, { recursive: true });
+      const file = path.join(dir, PROGRESS_FILE);
+      await appendFile(file, line);
+      if ((await stat(file)).size > maxBytes) {
+        await rename(file, path.join(dir, PROGRESS_ROTATED_FILE));
+      }
+    });
+    this.feeding = next.catch(() => {});
+    return next;
   }
 }
 

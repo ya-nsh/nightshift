@@ -5,12 +5,14 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { ClaudeCliAgent } from "./agent/cli.js";
 import { ClaudeSdkAgent, loadSdkQuery } from "./agent/sdk.js";
-import { type Config, ConfigError, loadConfig } from "./config.js";
+import { type Config, ConfigError, loadConfig, planSettings } from "./config.js";
+import { describeForecast, estimateItem, readHistory } from "./forecast.js";
 import { GhForge } from "./github.js";
 import { NodeHost, STOP_FILE } from "./host.js";
 import { init } from "./init.js";
 import { describeQueue, quote, releaseClaim } from "./issues.js";
 import { type Exit, newIssuesRunState, newRunState, Pipeline } from "./pipeline.js";
+import { formatPlan, makePlan, PlanError, parsePlanCount, writePlan } from "./plan.js";
 import type { Agent } from "./ports.js";
 import { preflight } from "./preflight.js";
 import { ShellReviewer } from "./reviewer.js";
@@ -25,6 +27,7 @@ import {
   type UsageWindow,
   usageLimits,
 } from "./usage.js";
+import { watch } from "./watch.js";
 
 const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -44,7 +47,12 @@ Usage:
                                              optional: extra instructions for every issue)
   nightshift resume [--answer TEXT] [--once] [--max-items N] [--usage-share PCT]
                                              continue a halted or paused run
+  nightshift plan [-n N] [--prompt TEXT | --prompt-file FILE] [--repo ALIAS] [--json] [--write]
+                                             preview the next N items (default 5) in a read-only
+                                             Claude session; changes nothing
   nightshift status [--json]                 show the current run
+  nightshift watch [--once]                  follow the current run live (q quits; --once prints
+                                             one frame)
   nightshift stop                            stop gracefully after the current step
 
 Options:
@@ -60,7 +68,7 @@ Options:
 Exit codes: 0 done or paused · 1 error · 2 blocked on a question · 3 halted · 130 interrupted
 Docs: https://github.com/ya-nsh/nightshift`;
 
-const COMMANDS = new Set(["init", "doctor", "run", "resume", "status", "stop"]);
+const COMMANDS = new Set(["init", "doctor", "run", "resume", "plan", "status", "watch", "stop"]);
 const EXIT_CODES: Record<Exit["kind"], number> = { done: 0, paused: 0, blocked: 2, halted: 3 };
 
 async function main(argv: string[]): Promise<number> {
@@ -78,6 +86,8 @@ async function main(argv: string[]): Promise<number> {
       force: { type: "boolean", default: false },
       answer: { type: "string" },
       json: { type: "boolean", default: false },
+      count: { type: "string", short: "n" },
+      write: { type: "boolean", default: false },
       "eject-prompts": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -121,8 +131,29 @@ async function main(argv: string[]): Promise<number> {
         ? 0
         : 1;
     }
+    case "plan": {
+      const count = parsePlanCount(values.count);
+      if (values.repo !== undefined && config.repos[values.repo] === undefined) {
+        throw new UsageError(
+          `unknown repo "${values.repo}"; configured: ${Object.keys(config.repos).join(", ")}`,
+        );
+      }
+      const given = values.prompt !== undefined || values["prompt-file"] !== undefined;
+      const prompt = given
+        ? await readPrompt(values.prompt, values["prompt-file"], cwd)
+        : undefined;
+      return plan(config, await store.load(), {
+        count,
+        ...(prompt === undefined ? {} : { prompt }),
+        ...(values.repo === undefined ? {} : { repo: values.repo }),
+        json: values.json,
+        write: values.write,
+      });
+    }
     case "status":
-      return status(await store.load(), values.json, config);
+      return await status(await store.load(), values.json, config);
+    case "watch":
+      return watch({ dir: config.dir, usage: config.usage, once: values.once });
     case "stop":
       await writeFile(path.join(config.dir, STOP_FILE), `${new Date().toISOString()}\n`);
       console.log("nightshift will stop after the current step");
@@ -264,6 +295,68 @@ async function releaseAbandonedIssue(state: RunState): Promise<void> {
   }
 }
 
+/**
+ * `nightshift plan` takes no lock and never writes state.json: it reads the run as it is, so it can
+ * run next to a live run without disturbing it.
+ */
+async function plan(
+  config: Config,
+  state: RunState | undefined,
+  options: { count: number; prompt?: string; repo?: string; json: boolean; write: boolean },
+): Promise<number> {
+  const holder = lockHolder(config.dir);
+  if (holder !== undefined) {
+    console.error(
+      `note: a run is being driven (pid ${holder}); planning from its state as of now, without touching it`,
+    );
+  }
+  const agent: Agent =
+    config.agent.backend === "sdk"
+      ? new ClaudeSdkAgent(config.agent, await loadSdkQuery(config.home))
+      : new ClaudeCliAgent(config.agent);
+  const controller = new AbortController();
+  let interrupts = 0;
+  const onSignal = () => {
+    interrupts += 1;
+    if (interrupts > 1) process.exit(130);
+    controller.abort();
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    console.error(
+      `planning the next ${options.count} item(s) · ${agent.name} · model ${planSettings(config.agent).model ?? "default"} · read-only · budget $${config.budget.plan_usd.toFixed(2)}`,
+    );
+    const outcome = await makePlan(
+      {
+        config,
+        templates: await loadTemplates(config.promptsDir),
+        agent,
+        usage: new ClaudeUsageMeter(config.agent.claude_path, config.home),
+        now: () => new Date(),
+        log: (line) => console.error(line),
+      },
+      state,
+      { ...options, signal: controller.signal },
+    );
+    if (!outcome.ok) {
+      const cost = outcome.costUsd > 0 ? ` (cost $${outcome.costUsd.toFixed(2)})` : "";
+      console.error(`nightshift plan: ${outcome.reason}${cost}`);
+      return outcome.aborted ? 130 : 1;
+    }
+    if (options.json) console.log(JSON.stringify(outcome.plan, null, 2));
+    else console.log(formatPlan(outcome.plan));
+    if (options.write) {
+      const file = await writePlan(config.dir, outcome.plan);
+      console.error(`wrote ${path.relative(process.cwd(), file) || file}`);
+    }
+    return 0;
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  }
+}
+
 function printExit(exit: Exit): void {
   const { state } = exit;
   const lines = [
@@ -345,6 +438,15 @@ async function status(state: RunState | undefined, json: boolean, config: Config
   } else if (limitsEnabled(limits)) {
     lines.push("usage: not read yet");
   }
+  const forecast = describeForecast({
+    estimate: estimateItem(await readHistory(config.dir), config.usage.forecast_percentile),
+    limits,
+    tally: usage?.tally ?? {},
+    windows: usage?.last?.windows,
+    ranges: config.schedule.active_hours,
+    now,
+  });
+  for (const line of forecast) lines.push(`forecast: ${line}`);
   console.log(lines.join("\n"));
   return 0;
 }
@@ -420,6 +522,7 @@ main(process.argv.slice(2)).then(
   (error: unknown) => {
     const known =
       error instanceof UsageError ||
+      error instanceof PlanError ||
       error instanceof ConfigError ||
       error instanceof LockedError ||
       String((error as { code?: unknown }).code ?? "").startsWith("ERR_PARSE_ARGS");

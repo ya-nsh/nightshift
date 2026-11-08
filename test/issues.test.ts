@@ -1,10 +1,14 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { issueEditArgs, toIssue } from "../src/github.js";
 import { describeQueue, ineligible, rankIssues } from "../src/issues.js";
 import { newIssuesRunState, Pipeline } from "../src/pipeline.js";
 import type { Issue } from "../src/ports.js";
+import { parseRange, type TimeRange } from "../src/schedule.js";
 import type { RunState } from "../src/state.js";
+import { describeEvent } from "../src/watch.js";
 import { FakeAgent, FakeForge, type Harness, harness } from "./fakes.js";
 
 const ISSUES = '[review]\ncommand = ""\n[tasks]\nsource = "github_issues"\n';
@@ -378,6 +382,82 @@ describe("GitHub issues as the task source", () => {
   });
 });
 
+describe("GitHub issues and the start gates", () => {
+  /** Three finished 40-minute items, so the forecast has a typical item. */
+  async function seedHistory(h: Harness) {
+    const dir = h.store.runDir("20261101-000000-past");
+    await mkdir(dir, { recursive: true });
+    const lines = [0, 1, 2].map((i) =>
+      JSON.stringify({
+        at: new Date(Date.UTC(2026, 10, 1, i)).toISOString(),
+        type: "item_done",
+        item: i + 1,
+        costUsd: 2,
+        usagePoints: { five_hour: 5, seven_day: 0 },
+        activeMs: 40 * 60_000,
+      }),
+    );
+    await writeFile(path.join(dir, "events.jsonl"), `${lines.join("\n")}\n`);
+  }
+  const lateNight = async (outside: "wait" | "halt") => {
+    const h = await harness(ISSUES);
+    await seedHistory(h);
+    h.config.schedule.active_hours = [parseRange("23:00-07:00") as TimeRange];
+    h.config.schedule.outside_hours = outside;
+    h.host.time = new Date(2026, 10, 4, 6, 40); // a 40-minute item would not end before 07:00
+    return h;
+  };
+
+  it("pauses before claiming when a new item would not fit, and picks on resume", async () => {
+    const h = await lateNight("halt");
+    h.forge.addIssue(1);
+    h.forge.addPr(10);
+    h.forge.closesOnMerge.set(10, 1);
+    const { pipeline, state } = start(h, new FakeAgent([]));
+    const exit = await pipeline.run({ signal: new AbortController().signal });
+    expect(exit.kind).toBe("paused");
+    expect(exit.reason).toContain("not starting a new item before active hours start again");
+    expect(state.item).toBeUndefined();
+    expect(h.forge.edits).toEqual([]);
+    expect(h.forge.comments).toEqual([]);
+
+    h.host.time = new Date(2026, 10, 4, 23, 0);
+    const agent = new FakeAgent([implement(10), finalized]);
+    const saved = (await h.store.load()) as RunState;
+    const again = await start(h, agent, saved).pipeline.run({
+      signal: new AbortController().signal,
+    });
+    expect(again.kind).toBe("done");
+    expect(agent.requests[0]?.prompt).toContain("GitHub issue #1");
+  });
+
+  it("waits before claiming, and implement does not forecast the item again", async () => {
+    const h = await lateNight("wait");
+    h.forge.addIssue(1);
+    h.forge.addPr(10);
+    h.forge.closesOnMerge.set(10, 1);
+    const claimedAt: Date[] = [];
+    h.forge.afterEdit = () => claimedAt.push(h.host.now());
+    const agent = new FakeAgent([implement(10), finalized]);
+    const exit = await start(h, agent).pipeline.run({ signal: new AbortController().signal });
+    expect(exit.kind).toBe("done");
+    expect(claimedAt[0]?.getTime()).toBeGreaterThanOrEqual(new Date(2026, 10, 4, 23, 0).getTime());
+    // Item-prefixed forecast lines: only the gate before picking forecasts, not implement.
+    const forecasts = h.host.logs.filter((l) => /^\[[^\]]+\] forecast:/.test(l));
+    expect(forecasts.length).toBeGreaterThan(0);
+    for (const line of forecasts) expect(line).toMatch(/^\[next issue\] forecast:/);
+  });
+
+  it("finishes without waiting when no issue is ready", async () => {
+    const h = await lateNight("wait");
+    const exit = await start(h, new FakeAgent([])).pipeline.run({
+      signal: new AbortController().signal,
+    });
+    expect(exit.kind).toBe("done");
+    expect(h.host.sleeps).toEqual([]);
+  });
+});
+
 describe("issue queue", () => {
   const rules = {
     label: "nightshift",
@@ -520,6 +600,33 @@ describe("gh issue JSON", () => {
     ]);
     expect(issueEditArgs({ addLabels: ["a", "b"] })).toEqual(["--add-label", "a,b"]);
     expect(issueEditArgs({})).toEqual([]);
+  });
+});
+
+describe("watch lines for issue events", () => {
+  it("describes them", () => {
+    const e = (type: string, fields: Record<string, unknown>) =>
+      describeEvent({ at: "2026-11-04T00:00:00Z", type, item: 2, ...fields });
+    const url = "https://github.com/acme/app/issues/5";
+    expect(e("issue_picked", { issue: url })).toEqual({
+      text: `item 2 · picked issue ${url}`,
+      style: "cyan",
+    });
+    expect(e("issue_claimed", { issue: url }).text).toBe(`item 2 · claimed issue ${url}`);
+    expect(e("issue_set_aside", { issue: url, summary: "already fixed" })).toEqual({
+      text: `item 2 · no change needed; set issue ${url} aside: already fixed`,
+      style: "yellow",
+    });
+    expect(e("issue_closed", { issue: url, by: "nightshift" }).text).toBe(
+      `item 2 · issue ${url} closed by nightshift`,
+    );
+    expect(e("issue_closed", { issue: url, by: "github" }).text).toBe(
+      `item 2 · issue ${url} closed`,
+    );
+    expect(e("issue_update_failed", { what: "comment on issue #5", error: "HTTP 502" })).toEqual({
+      text: "item 2 · could not comment on issue #5: HTTP 502",
+      style: "yellow",
+    });
   });
 });
 
