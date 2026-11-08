@@ -63,17 +63,29 @@ export interface ItemState {
   autoMergeSha?: string;
   /** The bounded loop whose cap halted the run; `resume` grants that loop fresh rounds. */
   capHit?: "fix_checks" | "resolve_conflicts";
+  /** With parallel lanes: the git worktree nightshift created for this item. */
+  worktree?: { path: string; base: string };
+  /** With parallel lanes: why this item's lane stopped while others went on; cleared by `resume`. */
+  stopped?: { kind: "halted" | "blocked" | "paused"; reason: string };
 }
 
+export const STATE_VERSION = 2;
+
 export interface RunState {
-  version: 1;
+  version: 2;
   runId: string;
   startedAt: string;
   status: "running" | "halted" | "done";
   haltReason?: string;
   itemsCompleted: number;
   costUsd: number;
-  item?: ItemState;
+  /**
+   * The items in progress, in the order they were handed over: at most one with `[limits] lanes = 1`.
+   * Items leave the list when they are done.
+   */
+  items: ItemState[];
+  /** Index the next handed-over item gets (indexes are never reused within a run). */
+  nextIndex: number;
   /** `--usage-share` given to `run` or `resume`; overrides `[usage] session_share` for this run. */
   usageShare?: number;
   usage?: UsageState;
@@ -88,6 +100,36 @@ export interface UsageState {
   points?: Partial<Record<UsageWindow, number>>;
   /** The latest reading, for `status`. */
   last?: { at: string; windows: UsageWindows };
+}
+
+/**
+ * Brings a state file written by an older nightshift up to date: version 1 held a single `item`,
+ * version 2 holds the list of `items` that parallel lanes work on.
+ */
+export function migrateState(raw: Record<string, unknown>): RunState {
+  if (raw.version === 1) {
+    const { item, ...rest } = raw as { item?: ItemState } & Record<string, unknown>;
+    const items = item === undefined ? [] : [item];
+    return {
+      ...(rest as Omit<RunState, "version" | "items" | "nextIndex">),
+      version: 2,
+      items,
+      nextIndex: nextIndexAfter(items),
+    };
+  }
+  if (raw.version !== STATE_VERSION) {
+    throw new Error(
+      `unsupported state version ${String(raw.version)} (this nightshift reads versions 1 and ${STATE_VERSION}; upgrade nightshift)`,
+    );
+  }
+  const state = raw as unknown as RunState;
+  if (!Array.isArray(state.items)) throw new Error("invalid state: items is not a list");
+  if (typeof state.nextIndex !== "number") state.nextIndex = nextIndexAfter(state.items);
+  return state;
+}
+
+function nextIndexAfter(items: readonly ItemState[]): number {
+  return items.reduce((max, item) => Math.max(max, item.index), 0) + 1;
 }
 
 export function newRunId(now: Date): string {
@@ -118,9 +160,7 @@ export class StateStore {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
-    const state = JSON.parse(text) as RunState;
-    if (state.version !== 1) throw new Error(`unsupported state version ${String(state.version)}`);
-    return state;
+    return migrateState(JSON.parse(text) as Record<string, unknown>);
   }
 
   save(state: RunState): Promise<void> {

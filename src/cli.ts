@@ -24,6 +24,7 @@ import {
   type UsageWindow,
   usageLimits,
 } from "./usage.js";
+import { GitWorktrees } from "./worktrees.js";
 
 const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -39,7 +40,7 @@ Usage:
   nightshift run (--prompt TEXT | --prompt-file FILE) [--repo ALIAS] [--once] [--max-items N]
                  [--usage-share PCT] [--force]
                                              start a run with the first item's prompt
-  nightshift resume [--answer TEXT] [--once] [--max-items N] [--usage-share PCT]
+  nightshift resume [--answer TEXT [--item N]] [--once] [--max-items N] [--usage-share PCT]
                                              continue a halted or paused run
   nightshift status [--json]                 show the current run
   nightshift stop                            stop gracefully after the current step
@@ -51,10 +52,12 @@ Options:
                   (overrides [usage] session_share; kept for later resumes; 0 = no share limit)
   --max-items N   stop after N completed items in this invocation (0 = no limit; overrides
                   [limits] max_items)
+  --item N        with parallel lanes, the item --answer is for when several wait for one
   -h, --help      show this help
   -v, --version   show the version
 
 Exit codes: 0 done or paused · 1 error · 2 blocked on a question · 3 halted · 130 interrupted
+            (with parallel lanes: the worst of the lanes)
 Docs: https://github.com/ya-nsh/nightshift`;
 
 const COMMANDS = new Set(["init", "doctor", "run", "resume", "status", "stop"]);
@@ -74,6 +77,7 @@ async function main(argv: string[]): Promise<number> {
       "usage-share": { type: "string" },
       force: { type: "boolean", default: false },
       answer: { type: "string" },
+      item: { type: "string" },
       json: { type: "boolean", default: false },
       "eject-prompts": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -105,6 +109,10 @@ async function main(argv: string[]): Promise<number> {
   const store = new StateStore(config.dir);
   const maxItems = values.once ? 1 : parseMaxItems(values["max-items"]);
   const usageShare = parseUsageShare(values["usage-share"]);
+  const answerItem = parseItem(values.item);
+  if (answerItem !== undefined && values.answer === undefined) {
+    throw new UsageError("--item goes with --answer");
+  }
 
   switch (command) {
     case "doctor": {
@@ -147,7 +155,7 @@ async function main(argv: string[]): Promise<number> {
         const state = newRunState(newRunId(now), now, repo, prompt);
         if (usageShare !== undefined) state.usageShare = usageShare;
         await store.save(state);
-        return drive(config, store, state, maxItems, undefined);
+        return drive(config, store, state, maxItems, undefined, undefined);
       });
     }
     case "resume":
@@ -164,7 +172,7 @@ async function main(argv: string[]): Promise<number> {
           await store.save(state);
         }
         if (!(await doctor(config, state.usageShare, state.usage?.tally))) return 1;
-        return drive(config, store, state, maxItems, values.answer);
+        return drive(config, store, state, maxItems, values.answer, answerItem);
       });
     default:
       throw new UsageError(`unknown command "${command}" (see --help)`);
@@ -177,6 +185,7 @@ async function drive(
   state: RunState,
   maxItems: number | undefined,
   answer: string | undefined,
+  answerItem: number | undefined,
 ): Promise<number> {
   const host = new NodeHost(config.dir, config.notify.command);
   const agent: Agent =
@@ -193,6 +202,7 @@ async function drive(
       host,
       store,
       usage: new ClaudeUsageMeter(config.agent.claude_path, config.home),
+      worktrees: new GitWorktrees(),
     },
     state,
   );
@@ -215,6 +225,7 @@ async function drive(
       signal: controller.signal,
       ...(maxItems === undefined ? {} : { maxItems }),
       ...(answer === undefined ? {} : { answer }),
+      ...(answerItem === undefined ? {} : { answerItem }),
     });
     printExit(exit);
     if (controller.signal.aborted) return 130;
@@ -232,9 +243,20 @@ function printExit(exit: Exit): void {
     `${exit.kind.toUpperCase()}: ${exit.reason}`,
     `items completed: ${state.itemsCompleted} · total cost: $${state.costUsd.toFixed(2)}${formatPoints(state.usage?.points)}`,
   ];
-  if (state.item?.pr) lines.push(`current PR: ${state.item.pr.url}`);
-  if (exit.kind === "blocked") lines.push('answer and continue: nightshift resume --answer "…"');
-  else if (exit.kind !== "done") lines.push("continue with: nightshift resume");
+  for (const item of state.items) {
+    if (item.pr)
+      lines.push(
+        `${state.items.length > 1 ? `${itemName(item)}: ` : "current "}PR: ${item.pr.url}`,
+      );
+  }
+  const questions = state.items.filter((item) => item.pendingQuestion !== undefined);
+  if (exit.kind === "blocked" && questions.length > 1) {
+    for (const item of questions) {
+      lines.push(`answer ${itemName(item)}: nightshift resume --answer "…" --item ${item.index}`);
+    }
+  } else if (exit.kind === "blocked") {
+    lines.push('answer and continue: nightshift resume --answer "…"');
+  } else if (exit.kind !== "done") lines.push("continue with: nightshift resume");
   console.log(lines.join("\n"));
 }
 
@@ -269,16 +291,20 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
         ? "running according to state.json, but no nightshift process holds the lock (it was killed); `nightshift resume` continues"
         : `running (pid ${holder})`
       : state.status;
-  const item = state.item;
   const lines = [
     `run ${state.runId} · ${running}${state.haltReason ? ` (${state.haltReason})` : ""}`,
     `started ${formatTime(state.startedAt, now)} · items completed ${state.itemsCompleted} · cost $${state.costUsd.toFixed(2)}${formatPoints(state.usage?.points)}`,
   ];
-  if (item) {
+  if (config.limits.lanes > 1 || state.items.length > 1) {
+    lines.push(`lanes: ${config.limits.lanes} · items in progress: ${state.items.length}`);
+  }
+  for (const item of state.items) {
+    const indent = state.items.length > 1 ? "  " : "";
     lines.push(
-      `item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}${formatPoints(item.usagePoints)}`,
+      `${state.items.length > 1 ? "- " : ""}item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}${formatPoints(item.usagePoints)}`,
     );
-    if (item.pr) lines.push(`PR ${item.pr.url}`);
+    if (item.worktree) lines.push(`${indent}worktree ${item.worktree.path}`);
+    if (item.pr) lines.push(`${indent}PR ${item.pr.url}`);
     const activity = item.activity;
     if (activity && holder !== undefined) {
       const last =
@@ -286,10 +312,13 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
           ? ""
           : ` · last: ${activity.last} (${ago(activity.lastAt ?? activity.since, now)} ago)`;
       lines.push(
-        `step ${activity.step} running for ${ago(activity.since, now)} · ${activity.tools} tool call(s)${last}`,
+        `${indent}step ${activity.step} running for ${ago(activity.since, now)} · ${activity.tools} tool call(s)${last}`,
       );
     }
-    if (item.pendingQuestion) lines.push(`waiting for an answer: ${item.pendingQuestion}`);
+    if (item.stopped && !item.pendingQuestion) {
+      lines.push(`${indent}lane stopped (${item.stopped.kind}): ${item.stopped.reason}`);
+    }
+    if (item.pendingQuestion) lines.push(`${indent}waiting for an answer: ${item.pendingQuestion}`);
   }
   if (state.waiting !== undefined && holder !== undefined) {
     lines.push(`waiting until ${formatTime(state.waiting.until, now)}: ${state.waiting.reason}`);
@@ -305,6 +334,10 @@ function status(state: RunState | undefined, json: boolean, config: Config): num
   }
   console.log(lines.join("\n"));
   return 0;
+}
+
+function itemName(item: RunState["items"][number]): string {
+  return item.label ?? `item ${item.index}`;
 }
 
 function formatPoints(points: Partial<Record<UsageWindow, number>> | undefined): string {
@@ -337,6 +370,13 @@ function parseMaxItems(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) throw new UsageError("--max-items must be a whole number ≥ 0");
+  return n;
+}
+
+function parseItem(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) throw new UsageError("--item must be an item number ≥ 1");
   return n;
 }
 

@@ -122,7 +122,7 @@ describe("pipeline", () => {
     const first = await pipeline.run({ signal: new AbortController().signal });
     expect(first.kind).toBe("blocked");
     expect(first.reason).toContain("Which region launches first?");
-    expect(state.item?.pendingQuestion).toBe("Which region launches first?");
+    expect(state.items[0]?.pendingQuestion).toBe("Which region launches first?");
 
     const saved = (await h.store.load()) as RunState;
     await expect(
@@ -163,7 +163,7 @@ describe("pipeline", () => {
     const first = await pipeline.run({ signal: new AbortController().signal });
     expect(first.kind).toBe("blocked");
     expect(first.state.itemsCompleted).toBe(1);
-    expect(first.state.item).toMatchObject({ index: 2, repo: "other", phase: "implement" });
+    expect(first.state.items[0]).toMatchObject({ index: 2, repo: "other", phase: "implement" });
 
     const saved = (await h.store.load()) as RunState;
     await start(h, agent, saved).pipeline.run({
@@ -315,7 +315,11 @@ describe("pipeline", () => {
       maxItems: 1,
     });
     expect(first.kind).toBe("paused");
-    expect(first.state.item).toMatchObject({ index: 2, phase: "implement", handoff: "task two" });
+    expect(first.state.items[0]).toMatchObject({
+      index: 2,
+      phase: "implement",
+      handoff: "task two",
+    });
 
     const saved = (await h.store.load()) as RunState;
     const second = await start(h, agent, saved).pipeline.run({
@@ -330,7 +334,7 @@ describe("pipeline", () => {
     h.forge.addPr(1);
     const agent = new FakeAgent([ready(), allDone]);
     const state = newRunState("r", h.host.now(), "main", "x");
-    Object.assign(state.item ?? {}, {
+    Object.assign(state.items[0] ?? {}, {
       phase: "address",
       inFlight: "address",
       sessionId: "session-9",
@@ -360,7 +364,7 @@ describe("pipeline", () => {
     const paused = await start(h, agent).pipeline.run({ signal: new AbortController().signal });
     expect(paused.kind).toBe("paused");
     expect(paused.reason).toContain("STOP");
-    expect(paused.state.item?.phase).toBe("review");
+    expect(paused.state.items[0]?.phase).toBe("review");
 
     const controller = new AbortController();
     controller.abort();

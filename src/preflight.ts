@@ -88,6 +88,30 @@ export async function preflight(
     );
   }
 
+  const { lanes, worktree_dir: worktreeDir } = config.limits;
+  if (lanes > 1) {
+    // Each lane's worktree starts from the default branch that origin/HEAD names.
+    const unset: string[] = [];
+    for (const [alias, dir] of Object.entries(config.repos)) {
+      if (!existsSync(dir)) continue;
+      const head = await run("git", [
+        "-C",
+        dir,
+        "symbolic-ref",
+        "--quiet",
+        "refs/remotes/origin/HEAD",
+      ]);
+      if (!head.ok) unset.push(`${alias} (run \`git -C ${dir} remote set-head origin --auto\`)`);
+    }
+    add(
+      "lanes",
+      unset.length === 0,
+      unset.length === 0
+        ? `${lanes} at once, worktrees in ${worktreeDir}`
+        : `origin/HEAD is not set in ${unset.join(", ")}, so nightshift cannot tell which branch a worktree starts from`,
+    );
+  }
+
   const command = config.review.command.trim();
   if (command === "") {
     add("review command", true, "none configured (review is skipped)");

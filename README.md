@@ -5,7 +5,8 @@
 nightshift drives [Claude Code](https://code.claude.com) through a project's backlog, one item at a
 time. Each item gets a **fresh session**, ends in a **pull request**, goes through an **independent
 review** and **CI**, is **merged** with a normal merge, and hands a written prompt to the next fresh
-session. It stops (and pings you) whenever a human is needed.
+session. It stops (and pings you) whenever a human is needed. With [parallel lanes](#parallel-lanes)
+it works on several independent items at once, each in its own git worktree.
 
 ```
           ┌──────────────────────────── one item ────────────────────────────┐
@@ -111,6 +112,10 @@ run; it never steers it.
 | Something failed (budget, CI, merge, review, disk, agent error) | 3 | fix the cause, then `nightshift resume` |
 | Ctrl-C | 130 | `nightshift resume` (the interrupted step restarts, and Claude is told to check what it already did) |
 
+With [parallel lanes](#parallel-lanes), a question or failure stops only its own lane: the others
+finish their current item first, and the exit code is the worst of the lanes. With several
+questions open, `nightshift resume --answer "…" --item N` picks the item.
+
 `nightshift resume` is a human saying "try again": an answer you gave is kept until the step it
 was meant for succeeds, a loop that hit its cap (CI fix rounds, conflict rounds) gets its rounds
 back, and a checks timeout starts over.
@@ -163,9 +168,49 @@ active_hours = ["23:00-07:00"]   # start Claude work only in these local-time ra
 [limits]
 max_items = 0                # 0 = until done or stopped (`--max-items 0` also means no limit)
 min_free_disk_gb = 0
+lanes = 1                    # items worked on at once; see "Parallel lanes" below
 ```
 
 Relative paths resolve against the directory that holds `.nightshift/`.
+
+### Parallel lanes
+
+With `[limits] lanes = N` (default 1, at most 8), up to N items run at the same time. `lanes = 1`
+is the classic loop described above: one item at a time, in the repository's own checkout.
+
+- **Isolation.** Each item gets a git worktree that nightshift creates under `[limits]
+  worktree_dir` (default `.nightshift/worktrees/<run>/<item>`), detached at the latest commit of the
+  repository's default branch (as `origin/HEAD` names it; `nightshift doctor` checks that it is set,
+  `git remote set-head origin --auto` sets it). The item's Claude session, its review command
+  (`{repo_path}` is the worktree) and every later step run there, and Claude is told to stay out of
+  the main checkout and the other worktrees. Once the item is done, nightshift removes the worktree
+  and, if the PR merged, its local branch.
+- **More items.** The first item runs alone. Its finalize step (the `finalize-lanes` prompt) hands
+  over up to as many next items as lanes are free, as a `next` list of `{repo, prompt}`. Claude sees
+  the items in progress and is told to pick only tasks that are independent of them and of each
+  other (no dependency, no overlapping code); fewer, or none, is fine. Each finalize gets the same
+  chance, so lanes fill up as items finish. An item whose finalize hands over nothing is simply done
+  while others are in progress; the run is done when no item is left.
+- **Merging.** Merges happen one at a time. After a sibling merged, a PR waits for GitHub to
+  recompute its mergeability before it merges; a PR that now conflicts goes through `resolve
+  conflicts` and CI again, and so does a PR that branch protection requires to be up to date with
+  its base (`BEHIND`). CI is not re-run just because the base moved, as when people merge in
+  parallel.
+- **Shared limits.** `[budget] invocation_usd` covers all lanes together (each running step reserves
+  what it may spend; `item_usd` stays per item), `[usage]` counts every reading once and stops all
+  running steps when a limit is reached, and `[schedule]`, `min_free_disk_gb` and `nightshift stop`
+  apply to every lane. `--max-items N` also caps how many items run at once.
+- **Stopping.** A question or a failure in one item (anything that would halt a one-lane run: CI,
+  merge, review, agent error, the item's budget) parks only that lane. The other lanes finish
+  their current item, merge and finalize included, then the run stops; items they hand over wait in
+  the state for `resume`. A run-wide stop (STOP, usage limit with `on_limit = "halt"`, outside
+  active hours with `outside_hours = "halt"`, disk, invocation budget) stops every lane at its next
+  step; running steps finish. Ctrl-C stops all of them at once.
+- **Exit code.** The worst of the lanes: 3 if any lane halted, else 2 if any waits for an answer,
+  else 0. The reason names each stopped item. `resume` restarts every parked lane; `resume --answer
+  "…"` answers the one open question, and `--item N` picks the item when several are open.
+- **Status.** `nightshift status` lists every item in progress: phase, worktree, PR, running step,
+  and why its lane stopped.
 
 ### Usage limits
 
@@ -277,6 +322,7 @@ colleague push access for the night.
 ├── state.json           # the current run (atomic writes)
 ├── lock                 # pid lock: one nightshift per state
 ├── STOP                 # created by `nightshift stop`
+├── worktrees/           # one git worktree per item in progress (lanes > 1)
 └── runs/<run-id>/
     ├── events.jsonl     # every transition, cost, usage and outcome
     └── item-<n>/        # each Claude step's streamed messages (.jsonl) and review log

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Parallel lanes.** `[limits] lanes = N` works on up to N items at once, each in a git worktree
+  nightshift creates (under `[limits] worktree_dir`) with its own Claude session, and removes once
+  the item is done. Finalize hands over up to as many next items as lanes are free (a `next` list),
+  told to pick only tasks independent of the items in progress. Merges are serialized, and a PR
+  re-checks mergeability (resolving conflicts, or catching up when protection requires it) after a
+  sibling merged. Budget, usage limits, active hours and STOP apply across lanes. A question or
+  failure parks only its lane while the others finish their current item; the exit code is the
+  worst lane's. `status` lists every item, `resume --answer … --item N` picks which question to
+  answer, and `doctor` checks that `origin/HEAD` is set. `lanes = 1` (the default) works as before.
+
+### Changed
+- The state file moved to version 2: it holds a list of `items` instead of one `item`. Version 1
+  files are migrated when loaded; older nightshift versions cannot read version 2.
+
 ## 0.3.0 — 2026-11-08
 
 ### Added

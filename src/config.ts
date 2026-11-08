@@ -18,6 +18,8 @@ const percent = z.number().min(0).max(100);
 
 export const PERMISSION_MODES = ["auto", "acceptEdits", "dontAsk", "bypassPermissions"] as const;
 export const MERGE_METHODS = ["merge", "rebase", "squash"] as const;
+/** Upper bound for `[limits] lanes`: each lane is a Claude session, a worktree and a PR at once. */
+export const MAX_LANES = 8;
 
 const configSchema = z.strictObject({
   default_repo: repoAlias.optional(),
@@ -72,6 +74,8 @@ const configSchema = z.strictObject({
     .strictObject({
       max_items: z.number().int().min(0).default(0),
       min_free_disk_gb: z.number().min(0).default(0),
+      lanes: z.number().int().min(1).max(MAX_LANES).default(1),
+      worktree_dir: z.string().min(1).default(`${NIGHTSHIFT_DIR}/worktrees`),
     })
     .prefault({}),
   usage: z
@@ -155,6 +159,7 @@ export function parseConfig(text: string, home: string): Config {
         ? resolve(raw.agent.claude_path)
         : raw.agent.claude_path,
     },
+    limits: { ...raw.limits, worktree_dir: resolve(raw.limits.worktree_dir) },
     home,
     dir: path.join(home, NIGHTSHIFT_DIR),
     repos: Object.fromEntries(Object.entries(raw.repos).map(([alias, p]) => [alias, resolve(p)])),
