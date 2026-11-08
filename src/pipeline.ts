@@ -10,6 +10,7 @@ import type {
   UsageMeter,
   UsageWindows,
 } from "./ports.js";
+import { isActive, nextStart } from "./schedule.js";
 import {
   finalizeResult,
   type ImplementResult,
@@ -29,7 +30,9 @@ import {
   limitsEnabled,
   missingWindows,
   sameWindow,
+  USAGE_WINDOWS,
   type UsageLimits,
+  type UsageWindow,
   usageLimits,
   WINDOW_LABEL,
 } from "./usage.js";
@@ -44,6 +47,8 @@ const USAGE_RESET_GRACE_MS = 60_000;
 const USAGE_WAIT_SLICE_MS = 60_000;
 const USAGE_READ_ATTEMPTS = 3;
 const USAGE_RETRY_MS = 5_000;
+/** While a step runs, progress is written to state.json at most this often. */
+const PROGRESS_SAVE_MS = 10_000;
 
 export interface PipelineDeps {
   config: Config;
@@ -58,7 +63,7 @@ export interface PipelineDeps {
 }
 
 export interface InvocationOptions {
-  /** Stop after this many completed items in this invocation (0 = config / unlimited). */
+  /** Stop after this many completed items in this invocation; 0 = no limit. Overrides the config. */
   maxItems?: number;
   /** Answer to the question the run halted on. */
   answer?: string;
@@ -153,6 +158,7 @@ export class Pipeline {
     } else if (item.pendingQuestion !== undefined && item.pendingAnswer === undefined) {
       throw new Error(`the run is waiting for an answer: ${item.pendingQuestion}\nuse --answer`);
     }
+    this.freshStart(item);
     const maxItems = options.maxItems ?? this.deps.config.limits.max_items;
     this.state.status = "running";
     delete this.state.haltReason;
@@ -180,6 +186,31 @@ export class Pipeline {
         return await this.halt("interrupted", "halted");
       }
       return await this.halt(`error: ${(error as Error).message}`, "halted");
+    }
+  }
+
+  /**
+   * A `resume` is a human saying "try again": bounded loops that halted the run get their rounds
+   * back, and timeouts restart, instead of halting again at once on the same cap or deadline.
+   */
+  private freshStart(item: ItemState): void {
+    if (item.capHit === "fix_checks") {
+      this.log(
+        item,
+        `resuming after the CI fix cap: ${this.deps.config.checks.max_fix_rounds} more fix round(s)`,
+      );
+      item.fixRound = 0;
+    } else if (item.capHit === "resolve_conflicts") {
+      this.log(
+        item,
+        `resuming after the conflict cap: ${this.deps.config.merge.max_conflict_rounds} more round(s)`,
+      );
+      item.conflictRound = 0;
+    }
+    delete item.capHit;
+    if (item.phase === "checks") {
+      delete item.checksSince;
+      delete item.noChecksSince;
     }
   }
 
@@ -257,7 +288,7 @@ export class Pipeline {
     if (disk) return disk;
     // A review command may well use Claude too (`claude -p "/code-review …"`): it is held to the
     // same limits, and what it uses counts as nightshift's.
-    const gate = await this.usageGate();
+    const gate = await this.gates();
     if (!gate.ok) return gate.exit;
     this.log(item, `review round ${item.reviewRound}/${review.max_rounds}`);
     const result = await this.deps.reviewer.run({
@@ -349,6 +380,7 @@ export class Pipeline {
       }
       if (summary.state === "failed") {
         if (item.fixRound >= checks.max_fix_rounds) {
+          item.capHit = "fix_checks";
           return this.halt(
             `checks failed after ${item.fixRound} fix round(s): ${summary.failed.join(", ")}`,
             "halted",
@@ -417,6 +449,10 @@ export class Pipeline {
       current = await forge.pullRequest(pr.repoSlug, pr.number);
     }
     if (current.state === "MERGED") {
+      if (item.autoMergeSha !== undefined) {
+        delete item.autoMergeSha;
+        return this.merged(item, pr, current.mergeCommitSha, "auto-merge");
+      }
       item.mergeSha = current.mergeCommitSha;
       item.phase = "finalize";
       return undefined;
@@ -425,25 +461,72 @@ export class Pipeline {
     if (current.isDraft) return this.halt(`PR #${pr.number} was turned into a draft`, "halted");
     if (current.headSha !== item.checkedSha) {
       this.log(item, "the PR head moved since checks passed; re-checking");
+      delete item.autoMergeSha;
       this.enterChecks(item);
+      return undefined;
+    }
+    if (item.autoMergeSha !== undefined) {
+      // Auto-merge is on: GitHub merges once the branch protection is satisfied (an approval).
+      await this.deps.host.sleep(this.deps.config.checks.poll_seconds * 1000, this.signal);
       return undefined;
     }
     if (current.mergeable === "CONFLICTING") {
       if (item.conflictRound >= merge.max_conflict_rounds) {
-        return this.halt(`PR #${pr.number} still conflicts with ${current.baseRefName}`, "halted");
+        item.capHit = "resolve_conflicts";
+        return this.halt(
+          `PR #${pr.number} still conflicts with ${current.baseRefName} after ${item.conflictRound} round(s)`,
+          "halted",
+        );
       }
       item.conflictRound += 1;
       item.phase = "resolve_conflicts";
       return undefined;
+    }
+    if (current.mergeStateStatus === "BLOCKED") {
+      const why =
+        current.reviewDecision === "REVIEW_REQUIRED"
+          ? "needs an approving review"
+          : current.reviewDecision === "CHANGES_REQUESTED"
+            ? "has changes requested by a reviewer"
+            : "is blocked by a branch protection rule";
+      if (merge.when_blocked === "auto") {
+        try {
+          await forge.merge(pr.repoSlug, pr.number, merge.method, current.headSha, { auto: true });
+        } catch (error) {
+          return this.halt(
+            `PR #${pr.number} ${why}, and enabling auto-merge failed (is "Allow auto-merge" on in the repo settings?): ${(error as Error).message}`,
+            "halted",
+          );
+        }
+        item.autoMergeSha = current.headSha;
+        this.log(item, `PR ${why}; auto-merge is on, waiting for GitHub to merge it`);
+        await this.event({ type: "auto_merge", item: item.index, pr: pr.url, reason: why });
+        return undefined;
+      }
+      return this.halt(
+        `PR #${pr.number} ${why} before it can merge: ${pr.url} (merge it yourself, or approve it and run \`nightshift resume\`; merge.when_blocked = "auto" waits instead)`,
+        "halted",
+      );
     }
     try {
       await forge.merge(pr.repoSlug, pr.number, merge.method, current.headSha);
     } catch (error) {
       return this.halt(`merge of PR #${pr.number} failed: ${(error as Error).message}`, "halted");
     }
-    const merged = await forge.pullRequest(pr.repoSlug, pr.number);
-    item.mergeSha = merged.mergeCommitSha;
-    this.log(item, `merged (${merge.method}) as ${merged.mergeCommitSha ?? "?"}`);
+    const after = await forge.pullRequest(pr.repoSlug, pr.number);
+    return this.merged(item, pr, after.mergeCommitSha, merge.method);
+  }
+
+  private async merged(
+    item: ItemState,
+    pr: NonNullable<ItemState["pr"]>,
+    sha: string | undefined,
+    how: string,
+  ): Promise<Exit | undefined> {
+    const { forge } = this.deps;
+    const { merge } = this.deps.config;
+    item.mergeSha = sha;
+    this.log(item, `merged (${how}) as ${sha ?? "?"}`);
     await this.event({ type: "merged", item: item.index, pr: pr.url, sha: item.mergeSha });
     if (merge.delete_branch) {
       try {
@@ -535,7 +618,7 @@ export class Pipeline {
       };
     }
 
-    const gate = await this.usageGate();
+    const gate = await this.gates();
     if (!gate.ok) return gate;
     // Cleared only once the step really starts again, so a pause before then keeps the restart.
     delete item.interruptedPhase;
@@ -574,7 +657,7 @@ export class Pipeline {
         `could not resume session (${call.result.detail}); retrying in a fresh session`,
       );
       delete item.sessionId;
-      const again = await this.usageGate();
+      const again = await this.gates();
       if (!again.ok) return again;
       call = await this.callAgent(
         item,
@@ -595,8 +678,6 @@ export class Pipeline {
       await this.event({ type: "usage_cut", item: item.index, step: template, reason: cut.reason });
       return { ok: false, exit: undefined };
     }
-    delete item.pendingAnswer;
-    delete item.pendingQuestion;
     await this.save();
 
     switch (result.outcome) {
@@ -604,7 +685,14 @@ export class Pipeline {
         throw new Aborted();
       case "success": {
         const parsed = schema.safeParse(result.structured);
-        if (parsed.success) return { ok: true, value: parsed.data };
+        if (parsed.success) {
+          // The answer has been acted on. Until a step succeeds, it stays, so a failed or
+          // interrupted step that is resumed gets it again instead of losing it.
+          delete item.pendingAnswer;
+          delete item.pendingQuestion;
+          await this.save();
+          return { ok: true, value: parsed.data };
+        }
         const issues = parsed.error.issues
           .map((i) => `${i.path.join(".")}: ${i.message}`)
           .join("; ");
@@ -644,25 +732,29 @@ export class Pipeline {
   ): Promise<AgentCall> {
     const attempt = Date.now();
     const guard = new AbortController();
-    const running = this.deps.agent.run({
-      cwd: this.repoPath(item),
-      prompt,
-      schema: toJsonSchema(schema),
-      ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
-      maxBudgetUsd,
-      artifactPath: this.artifact(item, `${template}-${attempt}.json`),
-      signal:
-        usageBefore === undefined ? this.signal : AbortSignal.any([this.signal, guard.signal]),
-    });
-    let cut: LimitHit | undefined;
+    const watch =
+      usageBefore === undefined ? undefined : this.watchUsage(item, template, usageBefore, guard);
+    const activity = this.trackActivity(item, template);
     let result: AgentResult;
-    if (usageBefore === undefined) {
-      result = await running;
-    } else {
-      const watched = await this.watchUsage(item, template, running, usageBefore, guard);
-      result = watched.result;
-      cut = watched.cut;
+    try {
+      const running = this.deps.agent.run({
+        cwd: this.repoPath(item),
+        prompt,
+        schema: toJsonSchema(schema),
+        ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+        maxBudgetUsd,
+        artifactPath: this.artifact(item, `${template}-${attempt}.jsonl`),
+        signal: watch === undefined ? this.signal : AbortSignal.any([this.signal, guard.signal]),
+        onEvent: (event) => {
+          if (event.type === "tool") activity.tool(event.name, event.detail);
+          else watch?.streamed(event.windows);
+        },
+      });
+      result = watch === undefined ? await running : await watch.until(running);
+    } finally {
+      activity.end();
     }
+    const cut = watch?.cut();
     item.costUsd += result.costUsd;
     this.state.costUsd += result.costUsd;
     this.invocationCostUsd += result.costUsd;
@@ -732,19 +824,68 @@ export class Pipeline {
           ),
         };
       }
-      const untilIso = new Date(until).toISOString();
-      this.deps.host.log(
-        `usage limit: ${hit.reason}; waiting until ${formatTime(untilIso, now)} for the ${WINDOW_LABEL[hit.window]} window to reset`,
+      const stopped = await this.sleepUntil(
+        until,
+        `usage limit: ${hit.reason}`,
+        `for the ${WINDOW_LABEL[hit.window]} window to reset`,
+        "usage_wait",
       );
-      usageState.waitingUntil = untilIso;
-      usageState.waitingFor = hit.reason;
-      await this.save();
-      await this.event({ type: "usage_wait", reason: hit.reason, until: untilIso });
-      const stopped = await this.waitUntil(until);
-      delete usageState.waitingUntil;
-      delete usageState.waitingFor;
-      await this.save();
       if (stopped) return { ok: false, exit: stopped };
+    }
+  }
+
+  /**
+   * Everything that must hold before Claude work starts: inside active hours and within the usage
+   * limits. A long usage wait can end outside active hours, so both are checked until both hold.
+   */
+  private async gates(): Promise<UsageGate> {
+    for (;;) {
+      const outside = await this.scheduleGate();
+      if (outside) return { ok: false, exit: outside };
+      const gate = await this.usageGate();
+      if (!gate.ok) return gate;
+      if (isActive(this.deps.config.schedule.active_hours, this.deps.host.now())) return gate;
+    }
+  }
+
+  /**
+   * Before Claude work: outside the configured active hours, waits for the next start (or pauses,
+   * with outside_hours = "halt"). A step already running is never cut by the schedule.
+   */
+  private async scheduleGate(): Promise<Exit | undefined> {
+    const { active_hours: ranges, outside_hours } = this.deps.config.schedule;
+    if (ranges.length === 0) return undefined;
+    const now = this.deps.host.now();
+    if (isActive(ranges, now)) return undefined;
+    const start = nextStart(ranges, now);
+    const hours = ranges.map((r) => r.text).join(", ");
+    if (outside_hours === "halt") {
+      return this.pause(
+        `outside active hours (${hours}); they start again ${formatTime(start.toISOString(), now)}`,
+      );
+    }
+    return this.sleepUntil(start.getTime(), `outside active hours (${hours})`, "", "schedule_wait");
+  }
+
+  /** Logs, records and performs a wait; returns an exit if a stop was requested meanwhile. */
+  private async sleepUntil(
+    until: number,
+    reason: string,
+    purpose: string,
+    eventType: string,
+  ): Promise<Exit | undefined> {
+    const untilIso = new Date(until).toISOString();
+    this.deps.host.log(
+      `${reason}; waiting until ${formatTime(untilIso, this.deps.host.now())}${purpose ? ` ${purpose}` : ""}`,
+    );
+    this.state.waiting = { until: untilIso, reason };
+    await this.save();
+    await this.event({ type: eventType, reason, until: untilIso });
+    try {
+      return await this.waitUntil(until);
+    } finally {
+      delete this.state.waiting;
+      await this.save();
     }
   }
 
@@ -763,66 +904,127 @@ export class Pipeline {
   }
 
   /**
-   * Runs alongside a Claude step: re-reads usage every `check_seconds`, adds what the step used to
-   * nightshift's tally, and stops the step as soon as a limit is reached. Takes a last reading when
-   * the step ends, so short steps are counted too.
+   * Runs alongside a Claude step and stops it as soon as a usage limit is reached. Usage comes from
+   * the `rate_limit_event`s Claude streams and, when none arrived for `check_seconds`, from a usage
+   * check. What changed counts toward nightshift's tally, and a last check when the step ends makes
+   * sure short steps are counted too.
    */
-  private async watchUsage(
+  private watchUsage(
     item: ItemState,
     template: TemplateName,
-    running: Promise<AgentResult>,
     before: UsageWindows,
     guard: AbortController,
-  ): Promise<{ result: AgentResult; cut: LimitHit | undefined }> {
+  ): {
+    streamed: (windows: UsageWindows) => void;
+    until: (running: Promise<AgentResult>) => Promise<AgentResult>;
+    cut: () => LimitHit | undefined;
+  } {
     const limits = this.usageLimits();
     const usageState = this.usageState();
-    const finished = new AbortController();
-    const settled = running.finally(() => finished.abort());
-    settled.catch(() => {}); // the rejection is handled by awaiting `running` below
-    const stepSignal = AbortSignal.any([finished.signal, this.signal]);
-    const startUsed = { ...usageState.tally };
+    const checkMs = this.deps.config.usage.check_seconds * 1000;
+    const startTally = structuredClone(usageState.tally);
     let previous = before;
+    let lastReadingAt = this.deps.host.now().getTime();
     let cut: LimitHit | undefined;
 
+    const apply = (windows: UsageWindows): void => {
+      account(usageState.tally, previous, windows);
+      previous = windows;
+      lastReadingAt = this.deps.host.now().getTime();
+      usageState.last = { at: this.deps.host.now().toISOString(), windows };
+      if (cut !== undefined) return;
+      const hit = limitHit(limits, usageState.tally, previous);
+      if (hit === undefined) return;
+      cut = hit;
+      this.log(item, `usage limit reached during ${template}: ${hit.reason}; stopping the step`);
+      guard.abort();
+    };
     const take = async (signal: AbortSignal | undefined): Promise<void> => {
       const reading = await this.deps.usage?.read(signal);
       if (reading === undefined || !reading.ok) return; // transient; the next reading catches up
-      account(usageState.tally, previous, reading.windows);
-      previous = reading.windows;
-      usageState.last = { at: this.deps.host.now().toISOString(), windows: reading.windows };
+      apply(reading.windows);
     };
 
-    while (!stepSignal.aborted) {
-      await this.deps.host.sleep(this.deps.config.usage.check_seconds * 1000, stepSignal);
-      if (stepSignal.aborted) break;
-      await take(stepSignal);
-      if (stepSignal.aborted) break;
-      await this.save();
-      const hit = limitHit(limits, usageState.tally, previous);
-      if (hit !== undefined) {
-        cut = hit;
-        this.log(item, `usage limit reached during ${template}: ${hit.reason}; stopping the step`);
-        guard.abort();
-        break;
-      }
-    }
-    const result = await running;
-    if (!this.signal.aborted) await take(undefined);
-    const used: Record<string, number> = {};
-    for (const [window, entry] of Object.entries(usageState.tally)) {
-      const start = startUsed[window as keyof typeof startUsed];
-      const base =
-        start !== undefined && sameWindow(start.resetsAt, entry.resetsAt) ? start.used : 0;
-      used[window] = entry.used - base;
-    }
-    await this.event({ type: "usage", item: item.index, step: template, points: used });
-    if (usageState.last !== undefined) {
-      this.log(
-        item,
-        `usage: ${describeUsage(usageState.last.windows, usageState.tally, limits, this.deps.host.now())}`,
+    const until = async (running: Promise<AgentResult>): Promise<AgentResult> => {
+      const finished = new AbortController();
+      running.then(
+        () => finished.abort(),
+        () => finished.abort(),
       );
+      const stepSignal = AbortSignal.any([finished.signal, this.signal]);
+      while (!stepSignal.aborted && cut === undefined) {
+        await this.deps.host.sleep(checkMs, stepSignal);
+        if (stepSignal.aborted) break;
+        if (this.deps.host.now().getTime() - lastReadingAt < checkMs) continue; // streamed
+        await take(stepSignal);
+        if (!stepSignal.aborted) await this.save();
+      }
+      const result = await running;
+      if (!this.signal.aborted) await take(undefined);
+      const points: Partial<Record<UsageWindow, number>> = {};
+      for (const window of USAGE_WINDOWS) {
+        const entry = usageState.tally[window];
+        if (entry === undefined) continue;
+        const start = startTally[window];
+        const base =
+          start !== undefined && sameWindow(start.resetsAt, entry.resetsAt) ? start.used : 0;
+        points[window] = entry.used - base;
+      }
+      this.addUsagePoints(item, points);
+      await this.event({ type: "usage", item: item.index, step: template, points });
+      if (usageState.last !== undefined) {
+        this.log(
+          item,
+          `usage: ${describeUsage(usageState.last.windows, usageState.tally, limits, this.deps.host.now())}`,
+        );
+      }
+      return result;
+    };
+
+    return { streamed: apply, until, cut: () => cut };
+  }
+
+  private addUsagePoints(item: ItemState, points: Partial<Record<UsageWindow, number>>): void {
+    const usageState = this.usageState();
+    for (const window of USAGE_WINDOWS) {
+      const p = points[window];
+      if (p === undefined || p <= 0) continue;
+      item.usagePoints ??= {};
+      item.usagePoints[window] = round2((item.usagePoints[window] ?? 0) + p);
+      usageState.points ??= {};
+      usageState.points[window] = round2((usageState.points[window] ?? 0) + p);
     }
-    return { result, cut };
+  }
+
+  /**
+   * Live progress of a Claude step: every tool call is logged, and `status` sees the step, its
+   * tool count and the latest call (state is saved at most every PROGRESS_SAVE_MS while it runs).
+   */
+  private trackActivity(
+    item: ItemState,
+    template: TemplateName,
+  ): { tool: (name: string, detail: string) => void; end: () => void } {
+    const now = () => this.deps.host.now();
+    item.activity = { step: template, since: now().toISOString(), tools: 0 };
+    let lastSave = now().getTime();
+    this.save().catch(() => {}); // so `status` shows the step from its start
+    return {
+      tool: (name, detail) => {
+        const activity = item.activity;
+        if (activity === undefined) return;
+        activity.tools += 1;
+        activity.last = detail === "" ? name : `${name} ${detail}`;
+        activity.lastAt = now().toISOString();
+        this.log(item, `${template} · ${activity.last}`);
+        if (now().getTime() - lastSave >= PROGRESS_SAVE_MS) {
+          lastSave = now().getTime();
+          this.save().catch(() => {});
+        }
+      },
+      end: () => {
+        delete item.activity;
+      },
+    };
   }
 
   /** Adds what was used since `before` (one reading, no watching) to nightshift's tally. */
@@ -830,6 +1032,7 @@ export class Pipeline {
     const reading = await this.readUsage(1);
     if (!reading.ok) return;
     const points = account(this.usageState().tally, before, reading.windows);
+    this.addUsagePoints(item, points);
     await this.save();
     await this.event({ type: "usage", item: item.index, step, points });
   }
@@ -977,3 +1180,7 @@ function elapsedMs(sinceIso: string, now: Date): number {
 }
 
 export type { Phase };
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}

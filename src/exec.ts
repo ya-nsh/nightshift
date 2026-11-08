@@ -11,6 +11,14 @@ export interface ExecOptions {
   timeoutMs?: number;
   /** Also stream stdout and stderr, in arrival order, to this file. */
   teeFile?: string;
+  /** Called with each complete stdout line as it arrives. */
+  onStdoutLine?: (line: string) => void;
+  /**
+   * Signal sent first on timeout or abort (default SIGTERM). With SIGINT, a program such as Claude
+   * Code gets the chance to report what it did before it exits; SIGTERM and then SIGKILL follow if
+   * it is still running after the grace period.
+   */
+  stopSignal?: NodeJS.Signals;
 }
 
 export interface ExecResult {
@@ -24,6 +32,8 @@ export interface ExecResult {
 }
 
 const KILL_GRACE_MS = 10_000;
+/** How long a program stopped with SIGINT may take to report and exit before SIGTERM. */
+export const INTERRUPT_GRACE_MS = 20_000;
 
 /**
  * Runs a command in its own process group, so a timeout or abort terminates everything it started
@@ -56,15 +66,24 @@ export function exec(
     let timedOut = false;
     let aborted = false;
     let killTimer: NodeJS.Timeout | undefined;
+    let stopping = false;
+    let pendingLine = "";
 
-    const terminate = () => {
-      if (child.pid === undefined || child.exitCode !== null) return;
-      killGroup(child.pid, "SIGTERM");
-      killTimer = setTimeout(
-        () => child.pid !== undefined && killGroup(child.pid, "SIGKILL"),
-        KILL_GRACE_MS,
-      );
+    const escalate = (signal: NodeJS.Signals, afterMs: number) => {
+      killTimer = setTimeout(() => {
+        if (child.pid === undefined || child.exitCode !== null) return;
+        killGroup(child.pid, signal);
+        if (signal === "SIGTERM") escalate("SIGKILL", KILL_GRACE_MS);
+      }, afterMs);
       killTimer.unref();
+    };
+    const terminate = () => {
+      if (stopping || child.pid === undefined || child.exitCode !== null) return;
+      stopping = true;
+      const first = options.stopSignal ?? "SIGTERM";
+      killGroup(child.pid, first);
+      if (first === "SIGTERM") escalate("SIGKILL", KILL_GRACE_MS);
+      else escalate("SIGTERM", INTERRUPT_GRACE_MS);
     };
     const onAbort = () => {
       aborted = true;
@@ -83,6 +102,12 @@ export function exec(
       out.push(chunk);
       all.push(chunk);
       tee?.write(chunk);
+      if (options.onStdoutLine) {
+        pendingLine += chunk.toString("utf8");
+        const lines = pendingLine.split("\n");
+        pendingLine = lines.pop() ?? "";
+        for (const line of lines) emitLine(line);
+      }
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       err.push(chunk);
@@ -94,6 +119,7 @@ export function exec(
       reject(new Error(`cannot run ${command}: ${error.message}`));
     });
     child.on("close", (code) => {
+      if (pendingLine !== "") emitLine(pendingLine);
       cleanup();
       resolve({
         code,
@@ -107,6 +133,14 @@ export function exec(
     if (options.input !== undefined) {
       child.stdin?.on("error", () => {}); // the child may exit before reading everything
       child.stdin?.end(options.input);
+    }
+
+    function emitLine(line: string) {
+      try {
+        options.onStdoutLine?.(line);
+      } catch {
+        // a broken listener must not break the command
+      }
     }
 
     function cleanup() {

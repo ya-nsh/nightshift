@@ -13,10 +13,17 @@ export interface AgentRequest {
   resumeSessionId?: string;
   /** Hard ceiling for this call, in USD. */
   maxBudgetUsd: number;
-  /** Where the adapter may store the raw transcript/result for debugging. */
+  /** Where the adapter stores the streamed messages (JSON lines) for debugging. */
   artifactPath: string;
+  /** Aborting stops the step gracefully, so Claude can still report what it cost. */
   signal: AbortSignal;
+  /** Progress while the step runs: tool calls, and plan usage when Claude reports it. */
+  onEvent?: (event: AgentEvent) => void;
 }
+
+export type AgentEvent =
+  | { type: "tool"; name: string; detail: string }
+  | { type: "usage"; windows: UsageWindows };
 
 export type AgentOutcome =
   | "success"
@@ -62,18 +69,26 @@ export interface PullRequest {
   mergeable: Mergeable;
   mergeCommitSha: string | undefined;
   checks: CheckSummary;
+  /** GitHub's review verdict, e.g. "APPROVED" or "REVIEW_REQUIRED"; undefined without reviews. */
+  reviewDecision?: string;
+  /** e.g. "CLEAN", "BLOCKED" (branch protection unmet), "BEHIND", "DIRTY", "UNKNOWN". */
+  mergeStateStatus?: string;
 }
 
 export interface Forge {
   /** `owner/name` of the repository checked out at `cwd`. */
   repoSlug(cwd: string): Promise<string>;
   pullRequest(repoSlug: string, number: number): Promise<PullRequest>;
-  /** Merges only if the head is still `headSha`, so nothing unreviewed or unchecked slips in. */
+  /**
+   * Merges only if the head is still `headSha`, so nothing unreviewed or unchecked slips in. With
+   * `auto`, enables GitHub auto-merge instead, so GitHub merges once branch protection allows.
+   */
   merge(
     repoSlug: string,
     number: number,
     method: "merge" | "rebase" | "squash",
     headSha: string,
+    options?: { auto?: boolean },
   ): Promise<void>;
   deleteBranch(repoSlug: string, branch: string): Promise<void>;
 }

@@ -3,45 +3,60 @@ import path from "node:path";
 import type { Config } from "../config.js";
 import { exec, tail } from "../exec.js";
 import type { Agent, AgentRequest, AgentResult } from "../ports.js";
+import { toAgentEvents } from "./events.js";
 import { interpretResult } from "./result.js";
 
 type AgentConfig = Config["agent"];
 
-/** Runs each step as `claude -p` (the prompt goes in on stdin, the result comes back as JSON). */
+/**
+ * Runs each step as `claude -p` with the prompt on stdin. Output is streamed (`stream-json`), so
+ * tool calls show up as progress while the step runs and the final result message comes last.
+ */
 export class ClaudeCliAgent implements Agent {
   readonly name = "claude-cli";
 
   constructor(private readonly config: AgentConfig) {}
 
   async run(request: AgentRequest): Promise<AgentResult> {
+    let resultMessage: unknown;
     const result = await exec(this.config.claude_path, buildCliArgs(this.config, request), {
       cwd: request.cwd,
       input: request.prompt,
       signal: request.signal,
+      // SIGINT lets Claude Code end the turn and still print its result (with the cost so far).
+      stopSignal: "SIGINT",
+      onStdoutLine: (line) => {
+        const message = parseLine(line);
+        if (message === undefined) return;
+        if ((message as { type?: unknown }).type === "result") resultMessage = message;
+        if (request.onEvent)
+          for (const event of toAgentEvents(message, request.cwd)) request.onEvent(event);
+      },
     });
     await mkdir(path.dirname(request.artifactPath), { recursive: true });
     await writeFile(request.artifactPath, result.stdout || result.stderr);
+    resultMessage ??= parseResultJson(result.stdout);
     if (result.aborted) {
+      const partial = resultMessage === undefined ? undefined : interpretResult(resultMessage);
       return {
         outcome: "aborted",
-        sessionId: undefined,
-        costUsd: 0,
+        sessionId: partial?.sessionId,
+        costUsd: partial?.costUsd ?? 0,
         structured: undefined,
         detail: "aborted",
       };
     }
-    const message = parseResultJson(result.stdout);
-    if (message === undefined) {
+    if (resultMessage === undefined) {
       const output = tail((result.stderr || result.stdout).trim(), 2000) || "(no output)";
       return {
         outcome: "error",
         sessionId: undefined,
         costUsd: 0,
         structured: undefined,
-        detail: `claude exited ${String(result.code)} without a JSON result: ${output}`,
+        detail: `claude exited ${String(result.code)} without a result: ${output}`,
       };
     }
-    return interpretResult(message);
+    return interpretResult(resultMessage);
   }
 }
 
@@ -49,7 +64,8 @@ export function buildCliArgs(config: AgentConfig, request: AgentRequest): string
   const args = [
     "-p",
     "--output-format",
-    "json",
+    "stream-json",
+    "--verbose",
     "--json-schema",
     JSON.stringify(request.schema),
     "--permission-mode",
@@ -69,23 +85,36 @@ export function buildCliArgs(config: AgentConfig, request: AgentRequest): string
   return args;
 }
 
-/** `--output-format json` prints one JSON object; tolerate stray lines (warnings) around it. */
+function parseLine(line: string): unknown {
+  const text = line.trim();
+  if (!text.startsWith("{")) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Finds the result message in Claude's output: the last `type: "result"` line of a stream, or a
+ * single JSON object (`--output-format json`, e.g. from an `extra_args` override). Stray lines such
+ * as warnings are skipped.
+ */
 export function parseResultJson(stdout: string): unknown {
   const text = stdout.trim();
   if (text === "") return undefined;
   try {
     return JSON.parse(text);
   } catch {
-    const lines = text.split("\n").reverse();
-    for (const line of lines) {
-      const candidate = line.trim();
-      if (!candidate.startsWith("{")) continue;
-      try {
-        return JSON.parse(candidate);
-      } catch {
-        // keep looking
-      }
-    }
-    return undefined;
+    // a stream, or noise around the JSON
   }
+  const lines = text.split("\n").reverse();
+  let fallback: unknown;
+  for (const line of lines) {
+    const message = parseLine(line);
+    if (message === undefined) continue;
+    if ((message as { type?: unknown }).type === "result") return message;
+    fallback ??= message;
+  }
+  return fallback;
 }

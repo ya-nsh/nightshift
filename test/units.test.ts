@@ -195,7 +195,8 @@ describe("claude CLI backend", () => {
     expect(args).toEqual([
       "-p",
       "--output-format",
-      "json",
+      "stream-json",
+      "--verbose",
       "--json-schema",
       '{"type":"object"}',
       "--permission-mode",

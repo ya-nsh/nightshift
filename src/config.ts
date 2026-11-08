@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
+import { parseRange, type TimeRange } from "./schedule.js";
 
 /** Directory (inside the "home" repo) that holds config, prompts overrides, state and logs. */
 export const NIGHTSHIFT_DIR = ".nightshift";
@@ -63,6 +64,7 @@ const configSchema = z.strictObject({
     .strictObject({
       method: z.enum(MERGE_METHODS).default("merge"),
       delete_branch: z.boolean().default(true),
+      when_blocked: z.enum(["halt", "auto"]).default("halt"),
       max_conflict_rounds: z.number().int().min(0).max(5).default(2),
     })
     .prefault({}),
@@ -80,6 +82,23 @@ const configSchema = z.strictObject({
       weekly_max: percent.default(0),
       on_limit: z.enum(["wait", "halt"]).default("wait"),
       check_seconds: z.number().int().min(10).max(3600).default(60),
+    })
+    .prefault({}),
+  schedule: z
+    .strictObject({
+      active_hours: z
+        .union([z.string(), z.array(z.string())])
+        .default([])
+        .transform((value, ctx): TimeRange[] => {
+          const ranges: TimeRange[] = [];
+          for (const text of typeof value === "string" ? [value] : value) {
+            const range = parseRange(text);
+            if (typeof range === "string") ctx.addIssue({ code: "custom", message: range });
+            else ranges.push(range);
+          }
+          return ranges;
+        }),
+      outside_hours: z.enum(["wait", "halt"]).default("wait"),
     })
     .prefault({}),
   notify: z.strictObject({ command: z.string().default("") }).prefault({}),

@@ -70,6 +70,7 @@ export interface FakePr {
 export class FakeForge implements Forge {
   readonly prs = new Map<number, FakePr>();
   readonly merges: Array<{ number: number; method: string; headSha: string }> = [];
+  readonly autoMerges: Array<{ number: number; method: string; headSha: string }> = [];
   readonly deletedBranches: string[] = [];
   mergeError: Error | undefined;
 
@@ -117,11 +118,16 @@ export class FakeForge implements Forge {
     number: number,
     method: "merge" | "rebase" | "squash",
     headSha: string,
+    options: { auto?: boolean } = {},
   ): Promise<void> {
     if (this.mergeError) return Promise.reject(this.mergeError);
     const fake = this.prs.get(number);
     if (fake === undefined) throw new Error(`no PR #${number}`);
     if (fake.pr.headSha !== headSha) return Promise.reject(new Error("head moved"));
+    if (options.auto) {
+      this.autoMerges.push({ number, method, headSha });
+      return Promise.resolve();
+    }
     this.merges.push({ number, method, headSha });
     fake.pr = { ...fake.pr, state: "MERGED", mergeCommitSha: `merge-${number}` };
     return Promise.resolve();

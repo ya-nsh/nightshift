@@ -56,6 +56,8 @@ max_fix_rounds = 2                # Claude attempts to fix failing checks
 method = "merge"                  # merge | rebase | squash
 delete_branch = true
 max_conflict_rounds = 2
+when_blocked = "halt"             # branch protection (e.g. a required approval) blocks the merge:
+                                  # "halt" and tell you, or "auto" to enable GitHub auto-merge and wait
 
 [limits]
 max_items = 0                     # items per invocation; 0 = until done or halted
@@ -73,6 +75,11 @@ weekly_max = 0
 on_limit = "wait"                 # "wait" for the window to reset, or "halt" (pause; resume later)
 check_seconds = 60                # how often usage is re-read while a step runs; a step that
                                   # crosses a limit is stopped and restarted after the reset
+
+[schedule]
+# Only start Claude work (steps and reviews) in these local-time ranges; a running step finishes.
+# active_hours = ["23:00-07:00"]
+outside_hours = "wait"            # "wait" for the next range, or "halt" (pause; resume later)
 
 [notify]
 # Runs on halt/finish with NIGHTSHIFT_EVENT, _KIND, _REASON, _ITEM, _PR, _COST, _RUN in the environment.
