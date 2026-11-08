@@ -3,6 +3,8 @@
  * in-memory fakes and the real adapters stay thin.
  */
 
+import type { PermissionMode } from "./config.js";
+
 export interface AgentRequest {
   /** Working directory for the session (the repo the item runs in). */
   cwd: string;
@@ -19,6 +21,13 @@ export interface AgentRequest {
   signal: AbortSignal;
   /** Progress while the step runs: tool calls, and plan usage when Claude reports it. */
   onEvent?: (event: AgentEvent) => void;
+  /**
+   * This step's effective settings (`[agent.steps.<step>]` over `[agent]`). Each one left out falls
+   * back to the backend's `[agent]` config; `model` left out there too means Claude Code's default.
+   */
+  model?: string;
+  maxTurns?: number;
+  permissionMode?: PermissionMode;
 }
 
 export type AgentEvent =

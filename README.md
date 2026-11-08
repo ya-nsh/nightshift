@@ -147,6 +147,9 @@ permission_mode = "auto"     # auto | acceptEdits | dontAsk | bypassPermissions
 max_turns = 200
 # add_dirs = [".."]          # let Claude work in sibling folders, e.g. git worktrees
 
+[agent.steps.implement]      # per-step overrides, see "Models per step" below
+model = "opus"
+
 [budget]
 item_usd = 25                # all Claude steps of one item together
 invocation_usd = 150         # one `run` / `resume`
@@ -244,6 +247,35 @@ Placeholders are substituted shell-quoted, and the same values are exported as `
 The default prompts live in [`prompts/`](prompts). `nightshift init --eject-prompts` copies them to
 `.nightshift/prompts/` and points `[prompts] dir` at them; any file there overrides the default of the
 same name. Placeholders such as `{{pr_number}}` are checked: an unknown one is an error, not a blank.
+
+### Models per step
+
+`[agent.steps.<step>]` overrides `model`, `max_turns` and `permission_mode` for one step; anything it
+leaves out comes from `[agent]` (and with no `model` anywhere, Claude Code picks its default). The
+steps are `implement`, `address`, `fix_checks`, `resolve_conflicts` and `finalize`; any other name,
+key or value is a config error.
+
+```toml
+[agent]
+model = "sonnet"             # every step without its own model
+
+[agent.steps.implement]
+model = "opus"               # the hard part
+max_turns = 300
+
+[agent.steps.finalize]
+model = "haiku"
+max_turns = 50
+```
+
+The steps of an item still share one Claude session: a step on another model resumes it
+(`--resume` with `--model`), and Claude Code carries the conversation over to the new model. The
+prompt cache is per model, though, so the first turn after a switch reads the whole session
+uncached: switch where it pays off, not on every step.
+
+`nightshift doctor` lists each step's model (and any `max_turns`/`permission_mode` override), every
+step's log line names its model (`[T3] address · model sonnet · budget $24.10`), and the `agent`
+event in `events.jsonl` records it. Both backends apply the overrides.
 
 ### Backends
 
