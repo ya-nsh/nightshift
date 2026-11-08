@@ -8,3 +8,6 @@ coverage/
 .nightshift/state.json
 .nightshift/lock
 .nightshift/STOP
+.nightshift/report.md
+.nightshift/daemon.log*
+.nightshift/daemon.lock

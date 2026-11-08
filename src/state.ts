@@ -63,6 +63,50 @@ export interface ItemState {
   autoMergeSha?: string;
   /** The bounded loop whose cap halted the run; `resume` grants that loop fresh rounds. */
   capHit?: "fix_checks" | "resolve_conflicts";
+  /** Where `pendingQuestion` was asked on GitHub (`[answers] via = "github"`). */
+  questionPost?: QuestionPost;
+}
+
+export interface QuestionPost {
+  /** A comment on the item's PR, or an issue opened because there was no PR yet. */
+  kind: "pr_comment" | "issue";
+  repoSlug: string;
+  /** The PR or issue number the conversation is on. */
+  number: number;
+  /** Id of the question comment (or of the issue). */
+  id: number;
+  url: string;
+  /** GitHub's creation time; only replies created at or after it count. */
+  postedAt: string;
+}
+
+/** Why a run stopped. The daemon decides on `cause`, never on the human-readable reason. */
+export type StopCause =
+  /** Nothing left to do. */
+  | "done"
+  /** Claude asked a question (`pendingQuestion`). */
+  | "question"
+  /** `nightshift stop`. */
+  | "stop_requested"
+  /** `--once`, `--max-items`, `[limits] max_items`. */
+  | "item_limit"
+  /** A `[usage]` limit with on_limit = "halt"; clears at `resumeAt`. */
+  | "usage_limit"
+  /** Outside `[schedule] active_hours` with outside_hours = "halt"; clears at `resumeAt`. */
+  | "outside_hours"
+  /** Ctrl-C (SIGINT). */
+  | "interrupted"
+  /** SIGTERM: a shutdown, logout or service stop; nobody chose to stop the run. */
+  | "terminated"
+  /** Something went wrong that a human must look at. */
+  | "failure";
+
+export interface StopInfo {
+  kind: "done" | "paused" | "blocked" | "halted";
+  cause: StopCause;
+  at: string;
+  /** When the cause clears by itself (usage window reset, start of active hours). */
+  resumeAt?: string;
 }
 
 export interface RunState {
@@ -79,6 +123,8 @@ export interface RunState {
   usage?: UsageState;
   /** Set while the run sleeps: for a usage window to reset, or for its active hours. */
   waiting?: { until: string; reason: string };
+  /** Why the run last stopped; unset while it runs. */
+  stop?: StopInfo;
 }
 
 export interface UsageState {
@@ -156,10 +202,10 @@ export class LockedError extends Error {
 }
 
 /** The pid holding the lock in `dir`, if that process is alive. */
-export function lockHolder(dir: string): number | undefined {
+export function lockHolder(dir: string, name = "lock"): number | undefined {
   let text: string;
   try {
-    text = readFileSync(path.join(dir, "lock"), "utf8");
+    text = readFileSync(path.join(dir, name), "utf8");
   } catch {
     return undefined;
   }
@@ -171,9 +217,10 @@ export function lockHolder(dir: string): number | undefined {
 export class Lock {
   private constructor(private readonly file: string) {}
 
-  static async acquire(dir: string): Promise<Lock> {
+  /** `name` is the lock file in `dir`; the daemon has its own, so it never blocks a run. */
+  static async acquire(dir: string, name = "lock"): Promise<Lock> {
     await mkdir(dir, { recursive: true });
-    const file = path.join(dir, "lock");
+    const file = path.join(dir, name);
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const handle = await open(file, "wx");

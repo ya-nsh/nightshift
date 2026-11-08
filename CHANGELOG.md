@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Answer from GitHub.** With `[answers] via = "github"`, a question is posted as a comment on the
+  item's PR, or as a new issue when there is no PR yet, with a hidden marker and reply instructions.
+  A later comment from an allowed user (`[answers] users`, default: the `gh` login) is the answer:
+  `nightshift resume` with no `--answer` picks it up, reacts with 👍 and closes the issue. Bots,
+  other users and nightshift's own comments are ignored; the reply is data for Claude, like `--answer`.
+- **Background service.** `nightshift service install|uninstall|status` runs the new
+  `nightshift daemon` as a launchd agent (macOS) or systemd user unit (Linux). It resumes a run when
+  an answer arrives on GitHub, when a usage-limit or active-hours pause clears, and after a reboot,
+  crash or SIGTERM; it leaves `nightshift stop`, the item limit, Ctrl-C and failures to you, respects
+  the run's lock, backs off, and logs to `.nightshift/daemon.log`.
+- **Morning report.** Every stop writes `.nightshift/runs/<run-id>/report.md` (copied to
+  `.nightshift/report.md`): items with PR, merged commit, Claude's summary, cost, usage points and
+  time per step, plus what is blocked or failed and why. `nightshift report [--run ID]` prints it,
+  and the notify command gets its path as `NIGHTSHIFT_REPORT` (and `NIGHTSHIFT_QUESTION_URL`).
+- `state.json` records why the run stopped (`stop.cause`, and `stop.resumeAt` when it clears by
+  itself); SIGTERM is recorded as `terminated`, apart from Ctrl-C. Events gain `phase` (time per
+  phase), `result` (each step's summary) and usage points on `item_done`.
+
 ## 0.3.0 — 2026-11-08
 
 ### Added

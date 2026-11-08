@@ -75,7 +75,7 @@ export interface PullRequest {
   mergeStateStatus?: string;
 }
 
-export interface Forge {
+export interface Forge extends ForgeComments {
   /** `owner/name` of the repository checked out at `cwd`. */
   repoSlug(cwd: string): Promise<string>;
   pullRequest(repoSlug: string, number: number): Promise<PullRequest>;
@@ -91,6 +91,42 @@ export interface Forge {
     options?: { auto?: boolean },
   ): Promise<void>;
   deleteBranch(repoSlug: string, branch: string): Promise<void>;
+}
+
+/** A comment nightshift posted, or an issue it opened (`id` is the issue's own id). */
+export interface PostedComment {
+  id: number;
+  url: string;
+  /** GitHub's timestamp (ISO), so replies are compared on GitHub's clock. */
+  createdAt: string;
+}
+
+/** A comment in a PR's or issue's conversation. */
+export interface IssueComment {
+  id: number;
+  author: string;
+  /** A GitHub App or other bot account. */
+  authorIsBot: boolean;
+  body: string;
+  createdAt: string;
+  url: string;
+}
+
+/** Conversation on PRs and issues: used to ask a human a question and read the answer. */
+export interface ForgeComments {
+  /** Login of the account the forge acts as. */
+  currentUser(): Promise<string>;
+  /** Comments on a PR or issue (`number`), the conversation tab. */
+  postComment(repoSlug: string, number: number, body: string): Promise<PostedComment>;
+  createIssue(
+    repoSlug: string,
+    title: string,
+    body: string,
+  ): Promise<PostedComment & { number: number }>;
+  /** Comments created at or after `since` (ISO), oldest first. */
+  listComments(repoSlug: string, number: number, since: string): Promise<IssueComment[]>;
+  addReaction(repoSlug: string, commentId: number, content: "+1" | "eyes"): Promise<void>;
+  closeIssue(repoSlug: string, number: number): Promise<void>;
 }
 
 export interface ReviewRequest {

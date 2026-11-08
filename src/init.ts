@@ -9,6 +9,10 @@ runs/
 state.json
 lock
 STOP
+report.md
+daemon.log
+daemon.log.1
+daemon.lock
 `;
 
 export function configTemplate(alias: string, ejectedPrompts: boolean): string {
@@ -81,8 +85,17 @@ check_seconds = 60                # how often usage is re-read while a step runs
 # active_hours = ["23:00-07:00"]
 outside_hours = "wait"            # "wait" for the next range, or "halt" (pause; resume later)
 
+[answers]
+# When Claude needs a human, ask on GitHub: a comment on the item's PR, or an issue in its repo when
+# there is no PR yet. A reply from one of \`users\` is the answer; \`nightshift resume\` (or the
+# background service, \`nightshift service install\`) picks it up and continues.
+via = "github"                    # "github" or "terminal" (only \`nightshift resume --answer\`)
+users = []                        # GitHub users whose replies count; empty = the \`gh\` login
+poll_seconds = 120                # how often the daemon checks for a reply
+
 [notify]
-# Runs on halt/finish with NIGHTSHIFT_EVENT, _KIND, _REASON, _ITEM, _PR, _COST, _RUN in the environment.
+# Runs on halt/finish with NIGHTSHIFT_EVENT, _KIND, _REASON, _ITEM, _PR, _COST, _RUN, _REPORT (the
+# morning report's path) and _QUESTION_URL (where a question was asked) in the environment.
 command = ""
 # command = 'curl -s -d "$NIGHTSHIFT_KIND: $NIGHTSHIFT_REASON" https://ntfy.sh/<your-topic>'
 # command = 'terminal-notifier -title nightshift -message "$NIGHTSHIFT_REASON"'

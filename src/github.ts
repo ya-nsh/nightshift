@@ -1,6 +1,14 @@
 import { tmpdir } from "node:os";
 import { exec } from "./exec.js";
-import type { CheckSummary, Forge, Mergeable, PrState, PullRequest } from "./ports.js";
+import type {
+  CheckSummary,
+  Forge,
+  IssueComment,
+  Mergeable,
+  PostedComment,
+  PrState,
+  PullRequest,
+} from "./ports.js";
 
 const PR_FIELDS = [
   "number",
@@ -64,10 +72,63 @@ export class GhForge implements Forge {
     }
   }
 
-  private async gh(args: string[], cwd: string = tmpdir()): Promise<string> {
+  async currentUser(): Promise<string> {
+    const login = (await this.gh(["api", "user", "--jq", ".login"])).trim();
+    if (login === "") throw new Error("gh api user returned no login");
+    return login;
+  }
+
+  async postComment(repoSlug: string, number: number, body: string): Promise<PostedComment> {
+    const out = await this.api("POST", `repos/${repoSlug}/issues/${number}/comments`, { body });
+    return toPosted(JSON.parse(out));
+  }
+
+  async createIssue(
+    repoSlug: string,
+    title: string,
+    body: string,
+  ): Promise<PostedComment & { number: number }> {
+    const json = JSON.parse(await this.api("POST", `repos/${repoSlug}/issues`, { title, body }));
+    return { ...toPosted(json), number: Number(json.number) };
+  }
+
+  async listComments(repoSlug: string, number: number, since: string): Promise<IssueComment[]> {
+    // `since` filters on the update time, so edited older comments still come back; the caller
+    // compares creation times. --jq prints one compact object per line across all pages.
+    const out = await this.gh([
+      "api",
+      "--paginate",
+      `repos/${repoSlug}/issues/${number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
+      "--jq",
+      ".[]",
+    ]);
+    return out
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => toIssueComment(JSON.parse(line)));
+  }
+
+  async addReaction(repoSlug: string, commentId: number, content: "+1" | "eyes"): Promise<void> {
+    await this.api("POST", `repos/${repoSlug}/issues/comments/${commentId}/reactions`, { content });
+  }
+
+  async closeIssue(repoSlug: string, number: number): Promise<void> {
+    await this.api("PATCH", `repos/${repoSlug}/issues/${number}`, {
+      state: "closed",
+      state_reason: "completed",
+    });
+  }
+
+  /** A REST call with a JSON body sent on stdin, so no text is ever parsed as a flag. */
+  private api(method: string, endpoint: string, body: Record<string, unknown>): Promise<string> {
+    return this.gh(["api", "-X", method, endpoint, "--input", "-"], tmpdir(), JSON.stringify(body));
+  }
+
+  private async gh(args: string[], cwd: string = tmpdir(), input?: string): Promise<string> {
     const result = await exec(this.ghPath, args, {
       cwd,
       env: { ...process.env, GH_PROMPT_DISABLED: "1", NO_COLOR: "1" },
+      ...(input === undefined ? {} : { input }),
     });
     if (result.code !== 0) {
       throw new Error(
@@ -99,6 +160,28 @@ export function toPullRequest(json: Record<string, unknown>): PullRequest {
     ...(typeof json.mergeStateStatus === "string"
       ? { mergeStateStatus: json.mergeStateStatus }
       : {}),
+  };
+}
+
+function toPosted(json: Record<string, unknown>): PostedComment {
+  const id = Number(json.id);
+  if (!Number.isInteger(id) || typeof json.html_url !== "string") {
+    throw new Error(`unexpected GitHub response: ${JSON.stringify(json).slice(0, 200)}`);
+  }
+  return { id, url: json.html_url, createdAt: String(json.created_at) };
+}
+
+/** Maps a REST issue comment. */
+export function toIssueComment(json: Record<string, unknown>): IssueComment {
+  const user = (json.user ?? {}) as { login?: unknown; type?: unknown };
+  const author = typeof user.login === "string" ? user.login : "";
+  return {
+    id: Number(json.id),
+    author,
+    authorIsBot: user.type === "Bot" || author.endsWith("[bot]"),
+    body: typeof json.body === "string" ? json.body : "",
+    createdAt: String(json.created_at),
+    url: String(json.html_url),
   };
 }
 
