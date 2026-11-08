@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Forecasts.** From finished items (this run's and earlier runs' `item_done` events), nightshift
+  estimates a typical item's usage points, active time and cost (median of the last 20 items by
+  default, `[usage] forecast_percentile`; at least 3 items). Before starting a new item it checks
+  that one fits in what is left of the `[usage]` shares and maxima and of the active hours, and
+  otherwise waits for the reset or the next active range (or pauses, per `on_limit` /
+  `outside_hours`) instead of starting an item that would be cut half-way, logging why.
+  `[usage] start_item_only_if_it_fits` (default: on when limits or active hours are set).
+  `nightshift status` and `doctor` show how many more items fit. `item_done` events now record
+  `usagePoints` and `activeMs`.
+
 ## 0.3.0 — 2026-11-08
 
 ### Added

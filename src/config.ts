@@ -82,6 +82,9 @@ const configSchema = z.strictObject({
       weekly_max: percent.default(0),
       on_limit: z.enum(["wait", "halt"]).default("wait"),
       check_seconds: z.number().int().min(10).max(3600).default(60),
+      /** Unset: on when usage limits or active hours are set. */
+      start_item_only_if_it_fits: z.boolean().optional(),
+      forecast_percentile: z.number().int().min(50).max(100).default(50),
     })
     .prefault({}),
   schedule: z
