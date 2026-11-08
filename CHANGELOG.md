@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`nightshift plan`.** A dry run: a fresh, read-only Claude session lists the next N items
+  (`-n`, default 5) nightshift would do, from the current run's pending handoff, `--prompt` /
+  `--prompt-file`, or the repositories' instructions. Each item has an ID, title, repo, why now,
+  rough size, risk, and whether it needs a human (with the question). `--json` prints the
+  structured result, `--write` saves `.nightshift/plan.md`. The session has only the Read, Glob
+  and Grep tools, runs in `dontAsk` mode without MCP servers, and ignores the configured tool and
+  permission settings. It costs at most `[budget] plan_usd` (default $2), refuses to start at a
+  `[usage]` limit, and takes no lock, so it is safe next to a live run.
+
 ## 0.3.0 — 2026-11-08
 
 ### Added

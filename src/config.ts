@@ -40,6 +40,8 @@ const configSchema = z.strictObject({
     .strictObject({
       item_usd: z.number().positive().default(25),
       invocation_usd: z.number().positive().default(150),
+      /** Ceiling for one `nightshift plan` session. */
+      plan_usd: z.number().positive().default(2),
     })
     .prefault({}),
   review: z
