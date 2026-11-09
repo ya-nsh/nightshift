@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-09
 
 ### Added
 - **Answer from GitHub.** With `[answers] via = "github"`, a question is posted as a comment on the
