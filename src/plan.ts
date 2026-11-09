@@ -139,6 +139,18 @@ export function planStart(
         tagged("handoff", item.handoff),
       );
     }
+    // With parallel lanes, the other items in progress are not tasks to plan either.
+    const others = live.moreItems ?? [];
+    if (others.length > 0) {
+      lines.push(
+        "",
+        "These items are in progress too, in parallel lanes; assume they land as their handoffs describe, and do not list them:",
+        ...others.map(
+          (other) =>
+            `- item ${other.index}${other.label ? ` (${other.label})` : ""} in \`${other.repo}\`, at the ${other.phase} step: ${brief(other.handoff)}`,
+        ),
+      );
+    }
     if (live.status === "halted") {
       lines.push("", `The run is halted: ${live.haltReason ?? "(no reason recorded)"}.`);
     }
@@ -354,4 +366,10 @@ function label(item: PlanItem): string {
 
 function oneLine(text: string): string {
   return text.trim().replace(/\s*\n\s*/g, " ");
+}
+
+/** A handoff on one line, cut short: enough to tell which task it is. */
+function brief(text: string): string {
+  const line = oneLine(text);
+  return line.length > 300 ? `${line.slice(0, 300)}…` : line;
 }

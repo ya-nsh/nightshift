@@ -1,6 +1,6 @@
 import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { RunState, StateStore } from "./state.js";
+import { type ItemState, type RunState, runItems, type StateStore } from "./state.js";
 import { USAGE_WINDOWS, type UsageWindow, WINDOW_LABEL } from "./usage.js";
 import { formatDuration } from "./watch.js";
 
@@ -165,9 +165,8 @@ export function buildReport(state: RunState, events: readonly Event[], now: Date
     }
   }
 
-  // The item in progress: the live state knows more than the journal.
-  const current = state.item;
-  if (current !== undefined) {
+  // The items in progress: the live state knows more than the journal.
+  for (const current of runItems(state)) {
     const item = itemAt(current.index) as ItemReport;
     item.repo = current.repo;
     if (current.label !== undefined) item.label = current.label;
@@ -247,7 +246,10 @@ function needsAttention(state: RunState, stops: readonly StopEvent[]): string[] 
   const out: string[] = [];
   const item = state.item;
   const stop = state.stop;
-  if (
+  const items = runItems(state);
+  if (items.length > 1) {
+    out.push(...lanesNeedAttention(state, items));
+  } else if (
     state.status === "halted" &&
     stop?.kind === "blocked" &&
     item?.pendingQuestion !== undefined
@@ -272,12 +274,48 @@ function needsAttention(state: RunState, stops: readonly StopEvent[]): string[] 
   return out;
 }
 
+/**
+ * With parallel lanes: each open question and each lane that stopped, with how to go on. Lanes
+ * stop separately, so the run's own stop says less about each of them.
+ */
+function lanesNeedAttention(state: RunState, items: readonly ItemState[]): string[] {
+  if (state.status !== "halted") return [];
+  const out: string[] = [];
+  const open = items.filter(
+    (i) => i.pendingQuestion !== undefined && i.pendingAnswer === undefined,
+  );
+  for (const item of open) {
+    out.push(
+      `- **Question** (${item.label ?? `item ${item.index}`}): ${oneLine(item.pendingQuestion ?? "")}`,
+    );
+    if (item.questionPost !== undefined) out.push(`  - Reply on GitHub: ${item.questionPost.url}`);
+    out.push(
+      `  - Or answer here: \`nightshift resume --answer "…"${open.length > 1 ? ` --item ${item.index}` : ""}\``,
+    );
+  }
+  const halted = items.filter((i) => i.stopped?.kind === "halted");
+  for (const item of halted) {
+    out.push(
+      `- **Halted** (${item.label ?? `item ${item.index}`}): ${oneLine(item.stopped?.reason ?? "")}`,
+    );
+  }
+  if (state.stop?.kind === "halted" && halted.length === 0) {
+    out.push(`- **Halted**: ${oneLine(state.haltReason ?? "")}`);
+  }
+  if (halted.length > 0 || state.stop?.kind === "halted") {
+    out.push("  - Fix the cause, then `nightshift resume`.");
+  }
+  return out;
+}
+
 function itemSection(item: ItemReport, state: RunState): string[] {
-  const current = state.item?.index === item.index ? state.item : undefined;
+  const items = runItems(state);
+  const current = items.find((i) => i.index === item.index);
   let status: string;
   if (item.done) status = item.mergeSha ? "merged" : "done";
   else if (item.setAside !== undefined) status = "set aside (no change needed)";
   else if (current === undefined) status = "not finished";
+  else if (items.length > 1) status = laneStatus(current);
   else if (state.status === "halted" && state.stop?.kind === "blocked") status = "blocked";
   else if (state.status === "halted" && state.stop?.kind === "halted") {
     status = `halted in ${current.phase}`;
@@ -306,6 +344,13 @@ function itemSection(item: ItemReport, state: RunState): string[] {
     lines.push(`- Time: active ${formatDuration(item.activeMs)}`);
   }
   return lines;
+}
+
+/** With parallel lanes, each item in progress has its own status. */
+function laneStatus(item: ItemState): string {
+  if (item.pendingQuestion !== undefined && item.pendingAnswer === undefined) return "blocked";
+  if (item.stopped?.kind === "halted") return `halted in ${item.phase}`;
+  return `in progress (${item.phase})`;
 }
 
 function addPoints(into: Points, raw: unknown): void {

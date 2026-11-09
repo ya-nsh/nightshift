@@ -67,6 +67,43 @@ export function finalizeResult(repoAliases: readonly [string, ...string[]]) {
 export type FinalizeResult = z.infer<ReturnType<typeof finalizeResult>>;
 
 /**
+ * The finalize result with parallel lanes: instead of one next task, up to `maxNext` (the lanes free
+ * once this item is done) tasks that are independent of the items still in progress.
+ */
+export function finalizeLanesResult(repoAliases: readonly [string, ...string[]], maxNext: number) {
+  return z.strictObject({
+    status: z
+      .enum(["continue", "all_done", "blocked"])
+      .describe(
+        "continue: post-merge steps are done and next holds the tasks to start now (it may be empty while other items are in progress). all_done: no task is left. blocked: a human must act or decide before the first task in next.",
+      ),
+    summary: z.string().describe("One or two sentences on the post-merge steps you did."),
+    next: z
+      .array(
+        z.strictObject({
+          repo: z.enum(repoAliases).describe("Alias of the repository the task runs in."),
+          prompt: z
+            .string()
+            .min(1)
+            .describe(
+              "The complete, self-contained prompt for a brand-new session that does this task.",
+            ),
+        }),
+      )
+      .max(maxNext)
+      .optional()
+      .describe(
+        `Up to ${maxNext} tasks to start now, each independent of every item in progress and of the others.`,
+      ),
+    question: z
+      .string()
+      .optional()
+      .describe("Required when status is blocked: the precise question for the human."),
+  });
+}
+export type FinalizeLanesResult = z.infer<ReturnType<typeof finalizeLanesResult>>;
+
+/**
  * Finalize for an item that came from a GitHub issue: nightshift takes the next task from the
  * issues, so there is no handoff to write.
  */

@@ -9,6 +9,7 @@ import {
   PROGRESS_ROTATED_FILE,
   type ProgressEntry,
   type RunState,
+  runItems,
   StateStore,
 } from "./state.js";
 import {
@@ -263,6 +264,18 @@ export function describeEvent(event: WatchEvent): { text: string; style?: Style 
     }
     case "usage_cut":
       return { text: `${item}${str(event.step)} stopped: ${str(event.reason)}`, style: "yellow" };
+    case "worktree":
+      return { text: `${item}worktree ${str(event.path)} (from ${str(event.base)})` };
+    case "lane_stop":
+      return {
+        text: `${item}lane ${str(event.kind)}: ${str(event.reason)}`,
+        style: event.kind === "blocked" ? "yellow" : "red",
+      };
+    case "run_stop":
+      return {
+        text: `stopping all lanes (${str(event.kind)}): ${str(event.reason)}`,
+        style: "yellow",
+      };
     case "forecast":
       return {
         text: `${item}forecast: ${str(event.reason)}`,
@@ -375,10 +388,12 @@ export function renderWatch(view: WatchView, options: RenderOptions): string[] {
       ],
     ]);
 
-    const item = state.item;
-    if (item === undefined) {
+    const items = runItems(state);
+    const item = items.length === 1 ? items[0] : undefined;
+    if (items.length === 0) {
       head.push([["no current item", "dim"]]);
-    } else {
+    }
+    for (const item of items) {
       const rounds = [
         item.reviewRound > 0 ? `review round ${item.reviewRound}` : "",
         item.fixRound > 0 ? `fix round ${item.fixRound}` : "",
@@ -392,6 +407,9 @@ export function renderWatch(view: WatchView, options: RenderOptions): string[] {
         [rounds.length > 0 ? ` · ${rounds.join(" · ")}` : ""],
       ]);
       if (item.pr) head.push([[`PR #${item.pr.number} `], [item.pr.url, "cyan"]]);
+      if (item.stopped !== undefined && !item.pendingQuestion) {
+        head.push([[`lane stopped (${item.stopped.kind}): `, "red"], [item.stopped.reason]]);
+      }
       if (item.pendingQuestion) {
         head.push([
           ["needs an answer: ", "yellow"],
@@ -430,6 +448,7 @@ export function renderWatch(view: WatchView, options: RenderOptions): string[] {
       ["cost ", "bold"],
       [`${money(state.costUsd)} run`],
       [item ? ` · ${money(item.costUsd)} item ${item.index}` : ""],
+      [items.length > 1 ? ` · ${items.length} items in progress` : ""],
       [
         usagePoints !== undefined && usagePoints > 0
           ? ` · ${round2(usagePoints)} points of 5-hour usage`
@@ -551,8 +570,7 @@ export function summarize(view: WatchView): string {
         : "not running (process gone; `nightshift resume` continues)",
     );
   else parts.push(`${state.status}${state.haltReason ? `: ${state.haltReason}` : ""}`);
-  const item = state.item;
-  if (item) {
+  for (const item of runItems(state)) {
     parts.push(`item ${item.index}${item.label ? ` — ${item.label}` : ""}`, `phase ${item.phase}`);
     if (item.pr) parts.push(item.pr.url);
     if (item.activity && alive) parts.push(`step ${item.activity.step}`);

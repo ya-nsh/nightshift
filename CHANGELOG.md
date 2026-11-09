@@ -67,6 +67,24 @@
   `[usage] start_item_only_if_it_fits` (default: on when limits or active hours are set).
   `nightshift status` and `doctor` show how many more items fit. `item_done` events now record
   `usagePoints` and `activeMs`.
+- **Parallel lanes.** `[limits] lanes = N` works on up to N items at once, each in a git worktree
+  nightshift creates (under `[limits] worktree_dir`) with its own Claude session, and removes once
+  the item is done. Finalize hands over up to as many next items as lanes are free (a `next` list),
+  told to pick only tasks independent of the items in progress; with `[tasks] source =
+  "github_issues"`, each free lane claims its own issue instead, after the same gates. Merges are
+  serialized, and a PR re-checks mergeability (resolving conflicts, or catching up when protection
+  requires it) after a sibling merged. Budget, usage limits, active hours and STOP apply across
+  lanes; forecasts hold back what the items in progress are still expected to use, and usage is
+  measured once for all running steps. Each lane keeps its `[agent.steps]` settings. A question or
+  failure parks only its lane (a question is asked on GitHub for that item) while the others finish
+  their current item; the exit code is the worst lane's. `status`, `watch`, the report and the
+  daemon understand several items, `resume --answer … --item N` picks which question to answer,
+  and `doctor` checks that `origin/HEAD` is set. `lanes = 1` (the default) works as before.
+
+### Changed
+- A run with more than one item in progress (parallel lanes) keeps the others in `state.json`'s
+  new `moreItems` and is version 2, which older nightshift versions refuse rather than lose items.
+  With one lane the file is unchanged (version 1).
 
 ## 0.3.0 — 2026-11-08
 

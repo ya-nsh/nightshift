@@ -5,7 +5,14 @@ import { fileURLToPath } from "node:url";
 import { allowedUsers, findAnswer, postQuestion } from "./answers.js";
 import type { Config } from "./config.js";
 import type { Forge } from "./ports.js";
-import { Lock, LockedError, type QuestionPost, type RunState, type StateStore } from "./state.js";
+import {
+  Lock,
+  LockedError,
+  type QuestionPost,
+  type RunState,
+  runItems,
+  type StateStore,
+} from "./state.js";
 
 /**
  * `nightshift daemon`: a long-lived loop that resumes the run when it can make progress without a
@@ -35,7 +42,13 @@ const PAUSE_LABEL = {
 export type Decision =
   | { action: "resume"; why: string }
   | { action: "post_question"; why: string }
-  | { action: "check_answer"; why: string; post: QuestionPost }
+  | {
+      action: "check_answer";
+      why: string;
+      post: QuestionPost;
+      /** With parallel lanes, every open question's post (`post` is the first); any answer resumes. */
+      posts?: QuestionPost[];
+    }
   | { action: "wait"; why: string; until: number }
   | { action: "idle"; why: string };
 
@@ -82,7 +95,11 @@ export function decide(
     case "terminated":
       return { action: "resume", why: "stopped by SIGTERM (shutdown, logout or service stop)" };
     case "question": {
-      const item = state.item;
+      // With parallel lanes several items may wait; an answer to any of them lets the run go on.
+      const open = runItems(state).filter(
+        (i) => i.pendingQuestion !== undefined && i.pendingAnswer === undefined,
+      );
+      const item = open[0] ?? runItems(state).find((i) => i.pendingQuestion !== undefined);
       if (item?.pendingQuestion === undefined) {
         return { action: "idle", why: "blocked, but no open question is recorded" };
       }
@@ -92,13 +109,20 @@ export function decide(
           why: 'blocked on a question; answer with `nightshift resume --answer "…"` ([answers] via = "terminal")',
         };
       }
-      if (item.questionPost === undefined) {
+      const asked = open.length === 0 ? [item] : open;
+      if (asked.some((i) => i.questionPost === undefined)) {
         return { action: "post_question", why: "blocked on a question that is not on GitHub yet" };
+      }
+      const posts = asked.map((i) => i.questionPost as QuestionPost);
+      const [post] = posts as [QuestionPost, ...QuestionPost[]];
+      if (posts.length === 1) {
+        return { action: "check_answer", why: `blocked on a question: ${post.url}`, post };
       }
       return {
         action: "check_answer",
-        why: `blocked on a question: ${item.questionPost.url}`,
-        post: item.questionPost,
+        why: `blocked on ${posts.length} questions: ${posts.map((p) => p.url).join(", ")}`,
+        post,
+        posts,
       };
     }
     case "stop_requested":
@@ -117,12 +141,12 @@ export function decide(
 /** A cheap fingerprint of how far the run is; unchanged after a resume means no progress. */
 export function progress(state: RunState | undefined): string {
   if (state === undefined) return "none";
-  const item = state.item;
+  const items = runItems(state);
   return [
     state.runId,
     state.itemsCompleted,
-    item?.index ?? "-",
-    item?.phase ?? "-",
+    items.length === 0 ? "-" : items.map((i) => i.index).join(","),
+    items.length === 0 ? "-" : items.map((i) => i.phase).join(","),
     state.costUsd.toFixed(4),
   ].join("|");
 }
@@ -178,7 +202,11 @@ export class Daemon {
       case "check_answer": {
         this.note(decision.why);
         if (now < this.nextAnswerCheck) return clamp(this.nextAnswerCheck - now, 1000, this.pollMs);
-        const found = await this.checkAnswer(decision.post, now);
+        let found = false;
+        for (const post of decision.posts ?? [decision.post]) {
+          found = (await this.checkAnswer(post, now)) || found;
+          if (found) break;
+        }
         if (!found) return this.pollMs;
         return this.resume(state, "an answer arrived on GitHub", signal);
       }
@@ -259,26 +287,33 @@ export class Daemon {
     }
     try {
       const state = await store.load();
-      const item = state?.item;
-      if (state === undefined || item?.pendingQuestion === undefined || item.questionPost) return;
-      const dir = config.repos[item.repo];
-      if (dir === undefined) throw new Error(`unknown repo alias "${item.repo}"`);
-      item.questionPost = await postQuestion(
-        forge,
-        config,
-        state.runId,
-        item,
-        item.pendingQuestion,
-        () => forge.repoSlug(dir),
-      );
-      await store.save(state);
-      await store.event(state.runId, {
-        type: "question_posted",
-        item: item.index,
-        kind: item.questionPost.kind,
-        url: item.questionPost.url,
-      });
-      this.deps.log(`asked on GitHub: ${item.questionPost.url}`);
+      if (state === undefined) return;
+      // With parallel lanes, every item waiting on a question gets it asked.
+      for (const item of runItems(state)) {
+        if (item.pendingQuestion === undefined || item.questionPost) continue;
+        try {
+          const dir = config.repos[item.repo];
+          if (dir === undefined) throw new Error(`unknown repo alias "${item.repo}"`);
+          item.questionPost = await postQuestion(
+            forge,
+            config,
+            state.runId,
+            item,
+            item.pendingQuestion,
+            () => forge.repoSlug(dir),
+          );
+          await store.save(state);
+          await store.event(state.runId, {
+            type: "question_posted",
+            item: item.index,
+            kind: item.questionPost.kind,
+            url: item.questionPost.url,
+          });
+          this.deps.log(`asked on GitHub: ${item.questionPost.url}`);
+        } catch (error) {
+          this.deps.log(`could not post the question on GitHub: ${(error as Error).message}`);
+        }
+      }
     } catch (error) {
       this.deps.log(`could not post the question on GitHub: ${(error as Error).message}`);
     } finally {

@@ -19,6 +19,7 @@ import type {
   ReviewResult,
   UsageMeter,
   UsageReading,
+  Worktrees,
 } from "../src/ports.js";
 import { StateStore } from "../src/state.js";
 import { loadTemplates, type Templates } from "../src/templates.js";
@@ -61,6 +62,75 @@ export class FakeAgent implements Agent {
     // Synchronous scripts resolve at once, like a step that finishes before any usage re-check.
     return partial instanceof Promise ? partial.then(complete) : Promise.resolve(complete(partial));
   }
+}
+
+/**
+ * Answers the Claude steps of several items running at once. Each item has its own script, found by
+ * a marker (e.g. "TASK-A") in the prompt of its first, fresh session; later steps resume that session
+ * and so reach the same script. Steps of different items can interleave in any order.
+ */
+export class LaneAgent implements Agent {
+  readonly name = "fake-lanes";
+  readonly requests: Array<{ key: string; request: AgentRequest }> = [];
+  private readonly sessions = new Map<string, string>();
+
+  constructor(private readonly scripts: Record<string, Scripted[]>) {}
+
+  /** The requests one item's steps made, in order. */
+  of(key: string): AgentRequest[] {
+    return this.requests.filter((r) => r.key === key).map((r) => r.request);
+  }
+
+  run(request: AgentRequest): Promise<AgentResult> {
+    const key =
+      request.resumeSessionId !== undefined
+        ? this.sessions.get(request.resumeSessionId)
+        : Object.keys(this.scripts).find((marker) => request.prompt.includes(marker));
+    if (key === undefined) throw new Error(`no script for: ${request.prompt.slice(0, 200)}`);
+    this.requests.push({ key, request });
+    const next = this.scripts[key]?.shift();
+    if (next === undefined)
+      throw new Error(`unexpected agent call #${this.of(key).length} for ${key}`);
+    const sessionId = request.resumeSessionId ?? `session-${key}`;
+    this.sessions.set(sessionId, key);
+    const partial = typeof next === "function" ? next(request) : next;
+    const complete = (p: Partial<AgentResult>): AgentResult => ({
+      outcome: "success",
+      sessionId,
+      costUsd: 0.1,
+      structured: undefined,
+      detail: "",
+      ...p,
+    });
+    return partial instanceof Promise ? partial.then(complete) : Promise.resolve(complete(partial));
+  }
+}
+
+/** Records the worktrees the pipeline asks for, without touching git. */
+export class FakeWorktrees implements Worktrees {
+  readonly created: Array<{ repoDir: string; dir: string }> = [];
+  readonly removed: Array<{ dir: string; branch: string | undefined }> = [];
+  failure: Error | undefined;
+
+  create(repoDir: string, dir: string): Promise<{ base: string }> {
+    if (this.failure !== undefined) return Promise.reject(this.failure);
+    if (!this.created.some((c) => c.dir === dir)) this.created.push({ repoDir, dir });
+    return Promise.resolve({ base: "main" });
+  }
+
+  remove(_repoDir: string, dir: string, branch?: string): Promise<void> {
+    this.removed.push({ dir, branch });
+    return Promise.resolve();
+  }
+}
+
+/** A promise the test resolves when it chooses, to hold a step until another lane gets somewhere. */
+export function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 export interface FakePr {

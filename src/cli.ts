@@ -29,7 +29,15 @@ import {
   stableNodePath,
   uninstallService,
 } from "./service.js";
-import { Lock, LockedError, lockHolder, newRunId, type RunState, StateStore } from "./state.js";
+import {
+  Lock,
+  LockedError,
+  lockHolder,
+  newRunId,
+  type RunState,
+  runItems,
+  StateStore,
+} from "./state.js";
 import { loadTemplates } from "./templates.js";
 import {
   ClaudeUsageMeter,
@@ -41,6 +49,7 @@ import {
   usageLimits,
 } from "./usage.js";
 import { watch } from "./watch.js";
+import { GitWorktrees } from "./worktrees.js";
 
 const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
@@ -58,7 +67,7 @@ Usage:
                                              start a run with the first item's prompt (with
                                              [tasks] source = "github_issues" the prompt is
                                              optional: extra instructions for every issue)
-  nightshift resume [--answer TEXT] [--once] [--max-items N] [--usage-share PCT]
+  nightshift resume [--answer TEXT [--item N]] [--once] [--max-items N] [--usage-share PCT]
                                              continue a halted or paused run
   nightshift plan [-n N] [--prompt TEXT | --prompt-file FILE] [--repo ALIAS] [--json] [--write]
                                              preview the next N items (default 5) in a read-only
@@ -81,10 +90,12 @@ Options:
                   (overrides [usage] session_share; kept for later resumes; 0 = no share limit)
   --max-items N   stop after N completed items in this invocation (0 = no limit; overrides
                   [limits] max_items)
+  --item N        with parallel lanes, the item --answer is for when several wait for one
   -h, --help      show this help
   -v, --version   show the version
 
 Exit codes: 0 done or paused · 1 error · 2 blocked on a question · 3 halted · 130 interrupted
+            (with parallel lanes: the worst of the lanes)
 Docs: https://github.com/ya-nsh/nightshift`;
 
 const COMMANDS = new Set([
@@ -117,6 +128,7 @@ async function main(argv: string[]): Promise<number> {
       "usage-share": { type: "string" },
       force: { type: "boolean", default: false },
       answer: { type: "string" },
+      item: { type: "string" },
       run: { type: "string" },
       json: { type: "boolean", default: false },
       count: { type: "string", short: "n" },
@@ -157,6 +169,10 @@ async function main(argv: string[]): Promise<number> {
   const store = new StateStore(config.dir);
   const maxItems = values.once ? 1 : parseMaxItems(values["max-items"]);
   const usageShare = parseUsageShare(values["usage-share"]);
+  const answerItem = parseItem(values.item);
+  if (answerItem !== undefined && values.answer === undefined) {
+    throw new UsageError("--item goes with --answer");
+  }
 
   switch (command) {
     case "doctor": {
@@ -251,7 +267,7 @@ async function main(argv: string[]): Promise<number> {
             : newRunState(runId, now, repo, prompt);
         if (usageShare !== undefined) state.usageShare = usageShare;
         await store.save(state);
-        return drive(config, store, state, maxItems, undefined);
+        return drive(config, store, state, maxItems, undefined, undefined);
       });
     }
     case "resume":
@@ -268,7 +284,7 @@ async function main(argv: string[]): Promise<number> {
           await store.save(state);
         }
         if (!(await doctor(config, state.usageShare, state.usage?.tally))) return 1;
-        return drive(config, store, state, maxItems, values.answer);
+        return drive(config, store, state, maxItems, values.answer, answerItem);
       });
     default:
       throw new UsageError(`unknown command "${command}" (see --help)`);
@@ -281,6 +297,7 @@ async function drive(
   state: RunState,
   maxItems: number | undefined,
   answer: string | undefined,
+  answerItem: number | undefined,
 ): Promise<number> {
   const host = new NodeHost(config.dir, config.notify.command);
   const agent: Agent =
@@ -297,6 +314,7 @@ async function drive(
       host,
       store,
       usage: new ClaudeUsageMeter(config.agent.claude_path, config.home),
+      worktrees: new GitWorktrees(),
     },
     state,
   );
@@ -320,6 +338,7 @@ async function drive(
       signal: controller.signal,
       ...(maxItems === undefined ? {} : { maxItems }),
       ...(answer === undefined ? {} : { answer }),
+      ...(answerItem === undefined ? {} : { answerItem }),
     });
     printExit(exit);
     if (controller.signal.aborted) return 130;
@@ -332,9 +351,17 @@ async function drive(
 
 /** `run --force` abandons a run: the issue it was working on is free for the next run again. */
 async function releaseAbandonedIssue(state: RunState): Promise<void> {
-  const issue = state.item?.issue;
-  if (issue === undefined) return;
   const forge = new GhForge();
+  for (const item of runItems(state)) {
+    if (item.issue !== undefined) await releaseIssue(forge, state, item.issue);
+  }
+}
+
+async function releaseIssue(
+  forge: GhForge,
+  state: RunState,
+  issue: NonNullable<RunState["item"]>["issue"] & {},
+): Promise<void> {
   try {
     await forge.commentIssue(
       issue.repoSlug,
@@ -419,13 +446,28 @@ function printExit(exit: Exit): void {
     `${exit.kind.toUpperCase()}: ${exit.reason}`,
     `items completed: ${state.itemsCompleted} · total cost: $${state.costUsd.toFixed(2)}${formatPoints(state.usage?.points)}`,
   ];
-  if (state.item?.pr) lines.push(`current PR: ${state.item.pr.url}`);
-  const post = state.item?.questionPost;
-  if (exit.kind === "blocked" && post !== undefined) {
-    lines.push(`answer on GitHub: ${post.url} (then \`nightshift resume\`, or let the daemon)`);
+  const items = runItems(state);
+  if (items.length <= 1) {
+    if (state.item?.pr) lines.push(`current PR: ${state.item.pr.url}`);
+    const post = state.item?.questionPost;
+    if (exit.kind === "blocked" && post !== undefined) {
+      lines.push(`answer on GitHub: ${post.url} (then \`nightshift resume\`, or let the daemon)`);
+    }
+    if (exit.kind === "blocked") lines.push('answer and continue: nightshift resume --answer "…"');
+    else if (exit.kind !== "done") lines.push("continue with: nightshift resume");
+  } else {
+    for (const item of items) {
+      if (item.pr) lines.push(`${itemName(item)}: ${item.pr.url}`);
+    }
+    const questions = items.filter((item) => item.pendingQuestion !== undefined);
+    for (const item of questions) {
+      const post = item.questionPost;
+      lines.push(
+        `answer ${itemName(item)}: ${post === undefined ? "" : `on GitHub: ${post.url}, or `}nightshift resume --answer "…"${questions.length > 1 ? ` --item ${item.index}` : ""}`,
+      );
+    }
+    if (exit.kind !== "done") lines.push("continue with: nightshift resume");
   }
-  if (exit.kind === "blocked") lines.push('answer and continue: nightshift resume --answer "…"');
-  else if (exit.kind !== "done") lines.push("continue with: nightshift resume");
   console.log(lines.join("\n"));
 }
 
@@ -461,17 +503,24 @@ async function status(state: RunState | undefined, json: boolean, config: Config
         ? "running according to state.json, but no nightshift process holds the lock (it was killed); `nightshift resume` continues"
         : `running (pid ${holder})`
       : state.status;
-  const item = state.item;
   const lines = [
     `run ${state.runId} · ${running}${state.haltReason ? ` (${state.haltReason})` : ""}`,
     `started ${formatTime(state.startedAt, now)} · items completed ${state.itemsCompleted} · cost $${state.costUsd.toFixed(2)}${formatPoints(state.usage?.points)}`,
   ];
-  if (item) {
+  const items = runItems(state);
+  const several = items.length > 1;
+  if (config.limits.lanes > 1 || several) {
+    lines.push(`lanes: ${config.limits.lanes} · items in progress: ${items.length}`);
+  }
+  for (const item of items) {
+    // One item reads as before; several are listed, each with its details indented.
+    const indent = several ? "  " : "";
     lines.push(
-      `item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}${formatPoints(item.usagePoints)}`,
+      `${several ? "- " : ""}item ${item.index}${item.label ? ` — ${item.label}` : ""} · repo ${item.repo} · phase ${item.phase} · cost $${item.costUsd.toFixed(2)}${formatPoints(item.usagePoints)}`,
     );
-    if (item.issue) lines.push(`issue ${item.issue.url} — ${item.issue.title}`);
-    if (item.pr) lines.push(`PR ${item.pr.url}`);
+    if (item.issue) lines.push(`${indent}issue ${item.issue.url} — ${item.issue.title}`);
+    if (item.worktree) lines.push(`${indent}worktree ${item.worktree.path}`);
+    if (item.pr) lines.push(`${indent}PR ${item.pr.url}`);
     const activity = item.activity;
     if (activity && holder !== undefined) {
       const last =
@@ -479,12 +528,15 @@ async function status(state: RunState | undefined, json: boolean, config: Config
           ? ""
           : ` · last: ${activity.last} (${ago(activity.lastAt ?? activity.since, now)} ago)`;
       lines.push(
-        `step ${activity.step} running for ${ago(activity.since, now)} · ${activity.tools} tool call(s)${last}`,
+        `${indent}step ${activity.step} running for ${ago(activity.since, now)} · ${activity.tools} tool call(s)${last}`,
       );
     }
-    if (item.pendingQuestion) lines.push(`waiting for an answer: ${item.pendingQuestion}`);
+    if (item.stopped && !item.pendingQuestion) {
+      lines.push(`${indent}lane stopped (${item.stopped.kind}): ${item.stopped.reason}`);
+    }
+    if (item.pendingQuestion) lines.push(`${indent}waiting for an answer: ${item.pendingQuestion}`);
     if (item.pendingQuestion && item.questionPost) {
-      lines.push(`asked on GitHub: ${item.questionPost.url}`);
+      lines.push(`${indent}asked on GitHub: ${item.questionPost.url}`);
     }
   }
   if (state.waiting !== undefined && holder !== undefined) {
@@ -520,6 +572,10 @@ async function describeTasks(config: Config): Promise<string> {
   }
   const queue = await describeQueue(new GhForge(), config);
   return `tasks: ${queue.detail}`;
+}
+
+function itemName(item: NonNullable<RunState["item"]>): string {
+  return item.label ?? `item ${item.index}`;
 }
 
 function formatPoints(points: Partial<Record<UsageWindow, number>> | undefined): string {
@@ -650,6 +706,13 @@ function parseMaxItems(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) throw new UsageError("--max-items must be a whole number ≥ 0");
+  return n;
+}
+
+function parseItem(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) throw new UsageError("--item must be an item number ≥ 1");
   return n;
 }
 

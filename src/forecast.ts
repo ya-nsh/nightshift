@@ -305,6 +305,12 @@ export interface ForecastContext {
   windows: UsageWindows | undefined;
   ranges: readonly TimeRange[];
   now: Date;
+  /**
+   * With parallel lanes: what each item already in progress has used so far. Each is expected to
+   * use a typical item's points in all, so what it has not used yet is held back from the room the
+   * new item gets. Time is not held back: items in progress run alongside the new one.
+   */
+  inProgress?: ReadonlyArray<Partial<Record<UsageWindow, number>>>;
 }
 
 /** A reading whose window has already reset counts as a fresh, empty window. */
@@ -391,10 +397,20 @@ export function decideStart(ctx: ForecastContext): StartDecision {
     if ((share <= 0 && max <= 0) || stat === undefined || raw === undefined) continue;
     const { reading, fresh } = current(raw, now);
     const room = roomIn(window, ctx, reading, fresh);
+    // Points the items in progress are still expected to use (none in a fresh window: their past
+    // use was in the old one, and what they still need is a guess either way).
+    const held = (ctx.inProgress ?? []).reduce(
+      (sum, used) => sum + Math.max(0, stat.value - (fresh ? 0 : (used[window] ?? 0))),
+      0,
+    );
+    if (held > 0) {
+      room.left -= held;
+      room.what += `, and the ${ctx.inProgress?.length} item(s) in progress are expected to use ~${formatPointsValue(held)} more`;
+    }
     const need = `a typical item uses ~${formatPointsValue(stat.value)} points of the ${WINDOW_LABEL[window]} window (${basis(estimate, stat)})`;
     if (stat.value <= room.left) {
       fits.push(
-        `~${formatPointsValue(stat.value)} of the ${formatPointsValue(room.left)} points left in the ${WINDOW_LABEL[window]} window`,
+        `~${formatPointsValue(stat.value)} of the ${formatPointsValue(room.left)} points left in the ${WINDOW_LABEL[window]} window${held > 0 ? " after the items in progress" : ""}`,
       );
     } else if (stat.value > room.full) {
       anyway.push(`${need}, more than a whole window allows; starting anyway`);

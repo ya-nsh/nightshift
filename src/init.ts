@@ -9,6 +9,7 @@ runs/
 state.json
 lock
 STOP
+worktrees/
 plan.md
 plans/
 report.md
@@ -79,6 +80,8 @@ when_blocked = "halt"             # branch protection (e.g. a required approval)
 [limits]
 max_items = 0                     # items per invocation; 0 = until done or halted
 min_free_disk_gb = 0              # halt before a step when free disk drops below this
+lanes = 1                         # items worked on at once, each in its own git worktree and PR
+# worktree_dir = ".nightshift/worktrees"   # where those worktrees go (lanes > 1)
 
 [usage]
 # Claude subscription limits, read from Claude Code (5-hour "session" window and weekly window).

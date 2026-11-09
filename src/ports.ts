@@ -229,3 +229,15 @@ export interface Host {
   notify(event: "halted" | "done", fields: Record<string, string>): Promise<void>;
   log(message: string): void;
 }
+
+/** Git worktrees that isolate items running in parallel lanes. */
+export interface Worktrees {
+  /**
+   * Makes `dir` a git worktree of the repository at `repoDir`, detached at the latest commit of the
+   * repository's default branch (fetched first), and returns that branch's name. An existing
+   * worktree of the same repository at `dir` is kept as it is.
+   */
+  create(repoDir: string, dir: string, signal: AbortSignal): Promise<{ base: string }>;
+  /** Removes the worktree at `dir`, and the local branch `branch` when given. Missing is fine. */
+  remove(repoDir: string, dir: string, branch?: string): Promise<void>;
+}

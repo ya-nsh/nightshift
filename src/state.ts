@@ -71,6 +71,10 @@ export interface ItemState {
   questionPost?: QuestionPost;
   /** The GitHub issue this item works on (`[tasks] source = "github_issues"`). */
   issue?: ItemIssue;
+  /** With parallel lanes: the git worktree nightshift created for this item. */
+  worktree?: { path: string; base: string };
+  /** With parallel lanes: why this item's lane stopped while others went on; cleared by `resume`. */
+  stopped?: { kind: "halted" | "blocked" | "paused"; reason: string; cause: StopCause };
 }
 
 export interface QuestionPost {
@@ -151,15 +155,27 @@ export interface IssuesRunState {
   skipped?: number[];
 }
 
+/**
+ * State files are version 1 while a run has at most one item in progress, which is always the case
+ * with `[limits] lanes = 1`; a run holding more items (`moreItems`) is version 2, so a nightshift that
+ * knows only one item refuses it instead of losing the others.
+ */
+export const STATE_VERSIONS = [1, 2] as const;
+
 export interface RunState {
-  version: 1;
+  version: (typeof STATE_VERSIONS)[number];
   runId: string;
   startedAt: string;
   status: "running" | "halted" | "done";
   haltReason?: string;
   itemsCompleted: number;
   costUsd: number;
+  /** The item in progress; with parallel lanes, the first of them (see `runItems`). */
   item?: ItemState;
+  /** With parallel lanes: the items in progress besides `item`, in the order they were handed over. */
+  moreItems?: ItemState[];
+  /** With parallel lanes: the index the next item gets (indexes are never reused within a run). */
+  nextIndex?: number;
   /** `--usage-share` given to `run` or `resume`; overrides `[usage] session_share` for this run. */
   usageShare?: number;
   usage?: UsageState;
@@ -195,6 +211,26 @@ export const PROGRESS_ROTATED_FILE = "progress.1.jsonl";
 /** The progress feed rotates when it grows past this, so it stays bounded at about twice this. */
 export const PROGRESS_MAX_BYTES = 256 * 1024;
 
+/** Every item in progress, in hand-over order: `item` first, then the other lanes' items. */
+export function runItems(state: Pick<RunState, "item" | "moreItems">): ItemState[] {
+  const more = state.moreItems ?? [];
+  return state.item === undefined ? [...more] : [state.item, ...more];
+}
+
+/** Replaces the items in progress (see `runItems`), keeping the file version 1 while it can be. */
+export function setRunItems(state: RunState, items: readonly ItemState[]): void {
+  const [first, ...more] = items;
+  if (first === undefined) delete state.item;
+  else state.item = first;
+  if (more.length > 0) {
+    state.moreItems = more;
+    state.version = 2;
+  } else {
+    delete state.moreItems;
+    state.version = 1;
+  }
+}
+
 export function newRunId(now: Date): string {
   const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
   return `${stamp}-${randomBytes(2).toString("hex")}`;
@@ -226,7 +262,14 @@ export class StateStore {
       throw error;
     }
     const state = JSON.parse(text) as RunState;
-    if (state.version !== 1) throw new Error(`unsupported state version ${String(state.version)}`);
+    if (!(STATE_VERSIONS as readonly number[]).includes(state.version)) {
+      throw new Error(
+        `unsupported state version ${String(state.version)} (this nightshift reads versions ${STATE_VERSIONS.join(" and ")}; upgrade nightshift)`,
+      );
+    }
+    if (state.moreItems !== undefined && !Array.isArray(state.moreItems)) {
+      throw new Error("invalid state: moreItems is not a list");
+    }
     return state;
   }
 
